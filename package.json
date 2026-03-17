@@ -1,7 +1,8 @@
 {
-  "name": "morphopai",
+  "name": "morpho4626",
   "version": "1.0.0",
-  "description": "Bundler3 transaction builder for Morpho flash-loan redeem flows",
+  "description": "Single-transaction Morpho Bundler3 builder for ERC-4626 exits and leveraged deposits",
+  "homepage": "https://morpho4626.web3resear.ch",
   "main": "dist/sdk/index.js",
   "scripts": {
     "build:sdk": "tsc -p tsconfig.json",
@@ -10,9 +11,16 @@
     "dev": "vite",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
-  "keywords": [],
+  "keywords": [
+    "morpho",
+    "erc4626",
+    "bundler3",
+    "defi",
+    "react",
+    "viem"
+  ],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "type": "module",
   "dependencies": {
     "@morpho-org/blue-sdk": "^5.18.0",

@@ -1595,7 +1595,7 @@ export function BundlerApp() {
     <div className="shell">
       <header className="hero">
         <div className="hero__copy">
-          <p className="eyebrow">Morpho x Bundler3</p>
+          <p className="eyebrow">morpho4626</p>
           <h1>Single-transaction flash-loan redeem / deposit builder</h1>
           <p className="lede">
             Sign Morpho <code>setAuthorizationWithSig</code> off-chain, run either a flash-loan exit or leveraged
