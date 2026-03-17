@@ -12,16 +12,10 @@ import {
   type Address,
   type Hex,
 } from 'viem'
-import { mainnet } from 'viem/chains'
 
 import { AccrualPosition, getChainAddresses, type Market } from '@morpho-org/blue-sdk'
 import { fetchMarket, fetchPosition, fetchToken, fetchUser, getAuthorizationTypedData } from '@morpho-org/blue-sdk-viem'
 
-import {
-  ETHEREUM_MORPHO,
-  SUSDF_USDF_ETHEREUM_MARKET_ID,
-  SUSDF_USDF_ETHEREUM_MARKET_PARAMS,
-} from '../sdk/markets.js'
 import {
   buildMarketId,
   buildMorphoBundlerDepositPlan,
@@ -32,6 +26,14 @@ import {
   type MarketParams,
   type RepayMode,
 } from '../sdk/morphoBundlerOfficial.js'
+import { MarketSelector } from './MarketSelector.js'
+import {
+  discoverErc4626MarketsOnChain,
+  fetchMorphoChains,
+  type DiscoveredVaultMarket,
+  type MorphoChainInfo,
+  supportsLocalMorphoChain,
+} from './morphoMarketDiscovery.js'
 
 type Eip1193Provider = {
   isMetaMask?: boolean
@@ -167,8 +169,6 @@ type DraftState = {
   executionPreview?: ExecutionPreview
 }
 
-const MAINNET_CHAIN_ID = 1
-
 const erc4626InspectorAbi = parseAbi([
   'function previewDeposit(uint256 assets) view returns (uint256 shares)',
   'function previewRedeem(uint256 shares) view returns (uint256 assets)',
@@ -188,7 +188,7 @@ export function BundlerApp() {
   const [providers, setProviders] = useState<ProviderOption[]>([])
   const [selectedProviderId, setSelectedProviderId] = useState<string>('')
   const [account, setAccount] = useState<Address | ''>('')
-  const [chainId, setChainId] = useState<number>(MAINNET_CHAIN_ID)
+  const [chainId, setChainId] = useState<number>(1)
   const [status, setStatus] = useState<StatusMessage>(defaultStatus)
   const [lastTxHash, setLastTxHash] = useState<string>('')
   const [refreshingSnapshot, setRefreshingSnapshot] = useState<boolean>(false)
@@ -201,16 +201,22 @@ export function BundlerApp() {
   const [lastSignedRequestJson, setLastSignedRequestJson] = useState<string>('')
   const [resolvingMarketConfig, setResolvingMarketConfig] = useState<boolean>(false)
   const [marketConfigError, setMarketConfigError] = useState<string>('')
+  const [morphoChains, setMorphoChains] = useState<MorphoChainInfo[]>([])
+  const [morphoChainsError, setMorphoChainsError] = useState<string>('')
+  const [discoveringMarkets, setDiscoveringMarkets] = useState<boolean>(false)
+  const [discoveredMarketsError, setDiscoveredMarketsError] = useState<string>('')
+  const [discoveredVaultMarkets, setDiscoveredVaultMarkets] = useState<DiscoveredVaultMarket[]>([])
+  const [discoveredMarketsChainId, setDiscoveredMarketsChainId] = useState<number | null>(null)
 
-  const [loanToken, setLoanToken] = useState<string>(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.loanToken)
-  const [collateralToken, setCollateralToken] = useState<string>(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.collateralToken)
-  const [oracle, setOracle] = useState<string>(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.oracle)
-  const [irm, setIrm] = useState<string>(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.irm)
-  const [lltv, setLltv] = useState<string>(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.lltv.toString())
-  const [marketIdInput, setMarketIdInput] = useState<string>(SUSDF_USDF_ETHEREUM_MARKET_ID)
+  const [loanToken, setLoanToken] = useState<string>('')
+  const [collateralToken, setCollateralToken] = useState<string>('')
+  const [oracle, setOracle] = useState<string>('')
+  const [irm, setIrm] = useState<string>('')
+  const [lltv, setLltv] = useState<string>('')
+  const [marketIdInput, setMarketIdInput] = useState<string>('')
   const [loanTokenDecimals, setLoanTokenDecimals] = useState<string>('18')
   const [collateralTokenDecimals, setCollateralTokenDecimals] = useState<string>('18')
-  const [vaultAddress, setVaultAddress] = useState<string>(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.collateralToken)
+  const [vaultAddress, setVaultAddress] = useState<string>('')
 
   const [builderMode, setBuilderMode] = useState<BuilderMode>('redeem')
   const [repayMode, setRepayMode] = useState<RepayMode>('full-shares')
@@ -227,6 +233,22 @@ export function BundlerApp() {
   const [autoRevoke, setAutoRevoke] = useState<boolean>(true)
 
   const selectedProvider = providers.find((provider) => provider.id === selectedProviderId) ?? null
+  const currentMorphoChain = morphoChains.find((chain) => chain.id === chainId) ?? null
+  const isChainSupportedLocally = supportsLocalMorphoChain(chainId)
+  const isCurrentChainSupported = currentMorphoChain ? isChainSupportedLocally : morphoChainsError ? isChainSupportedLocally : false
+  const currentMorphoAddress = isChainSupportedLocally ? getChainAddresses(chainId).morpho : null
+  const selectedDiscoveredMarketId =
+    discoveredVaultMarkets.find((market) => market.marketId.toLowerCase() === marketIdInput.trim().toLowerCase())?.marketId ?? ''
+  const currentChainLabel = currentMorphoChain
+    ? `${currentMorphoChain.network} (${currentMorphoChain.currency})`
+    : `Chain ${chainId}`
+  const marketSelectorHelperText = !selectedProvider
+    ? 'Connect a wallet to auto-discover Morpho listed ERC-4626 markets on the active chain.'
+    : !isCurrentChainSupported
+      ? currentMorphoChain
+        ? 'The current chain is not supported by the installed Morpho SDK.'
+        : morphoChainsError || 'Switch to a Morpho-supported chain to auto-discover markets.'
+      : `Using Morpho listed markets on ${currentChainLabel}. Classification comes from on-chain ERC-4626 preview probes, and vault/curator metadata comes from Morpho Blue API.`
 
   useEffect(() => {
     const syncProviders = () => {
@@ -258,6 +280,27 @@ export function BundlerApp() {
       window.clearTimeout(timeoutId)
       window.removeEventListener('ethereum#initialized', handleProviderInitialized as EventListener)
       window.removeEventListener('eip6963:announceProvider', handleEip6963Announcement as EventListener)
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+
+    void (async () => {
+      try {
+        const chains = await fetchMorphoChains()
+        if (cancelled) return
+        setMorphoChains(chains)
+        setMorphoChainsError('')
+      } catch (error) {
+        if (cancelled) return
+        setMorphoChains([])
+        setMorphoChainsError(error instanceof Error ? error.message : 'Failed to load Morpho supported chains.')
+      }
+    })()
+
+    return () => {
+      cancelled = true
     }
   }, [])
 
@@ -300,17 +343,64 @@ export function BundlerApp() {
   }, [selectedProvider, account])
 
   useEffect(() => {
-    if (!selectedProvider || !account || chainId !== MAINNET_CHAIN_ID) {
+    if (!selectedProvider || !isCurrentChainSupported) return
+    if (discoveredMarketsChainId === chainId) return
+
+    setBaseSnapshot(null)
+    setVaultSnapshot(null)
+    setMarketIdInput('')
+    setLoanToken('')
+    setCollateralToken('')
+    setOracle('')
+    setIrm('')
+    setLltv('')
+    setVaultAddress('')
+    setSnapshotError('Discovering ERC-4626 markets on the current chain...')
+  }, [selectedProvider, isCurrentChainSupported, discoveredMarketsChainId, chainId])
+
+  useEffect(() => {
+    if (!selectedProvider || !account || !isCurrentChainSupported) {
       setBaseSnapshot(null)
-      setSnapshotError(account ? 'Switch to Ethereum mainnet to load Morpho state.' : '')
+      setSnapshotError(
+        account
+          ? currentMorphoChain
+            ? 'The current chain is not supported by the installed Morpho SDK.'
+            : morphoChainsError
+              ? morphoChainsError
+              : 'Switch to a Morpho-supported chain to load Morpho state.'
+          : '',
+      )
+      return
+    }
+    if (!marketIdInput.trim()) {
+      setBaseSnapshot(null)
+      setSnapshotError(
+        discoveringMarkets
+          ? 'Discovering ERC-4626 markets on the current chain...'
+          : 'Choose a discovered market or paste a Market ID.',
+      )
       return
     }
 
     void refreshBaseSnapshot()
-  }, [selectedProvider, account, chainId, marketIdInput, loanToken, collateralToken, oracle, irm, lltv])
+  }, [
+    selectedProvider,
+    account,
+    discoveringMarkets,
+    isCurrentChainSupported,
+    currentMorphoChain,
+    discoveredMarketsChainId,
+    morphoChainsError,
+    marketIdInput,
+    loanToken,
+    collateralToken,
+    oracle,
+    irm,
+    lltv,
+  ])
 
   useEffect(() => {
-    if (!selectedProvider || chainId !== MAINNET_CHAIN_ID) {
+    if (!selectedProvider || !isCurrentChainSupported) {
       setResolvingMarketConfig(false)
       setMarketConfigError('')
       return
@@ -368,10 +458,10 @@ export function BundlerApp() {
       cancelled = true
       window.clearTimeout(timeoutId)
     }
-  }, [selectedProvider, chainId, marketIdInput])
+  }, [selectedProvider, isCurrentChainSupported, chainId, marketIdInput])
 
   useEffect(() => {
-    if (!selectedProvider || !account || chainId !== MAINNET_CHAIN_ID) {
+    if (!selectedProvider || !account || !isCurrentChainSupported) {
       setVaultSnapshot(null)
       setVaultError('')
       return
@@ -418,7 +508,7 @@ export function BundlerApp() {
     builderMode,
     selectedProvider,
     account,
-    chainId,
+    isCurrentChainSupported,
     vaultAddress,
     flashAssets,
     loanTokenDecimals,
@@ -428,6 +518,59 @@ export function BundlerApp() {
     collateralTokenDecimals,
     baseSnapshot?.collateral,
   ])
+
+  useEffect(() => {
+    if (!selectedProvider || !isCurrentChainSupported) {
+      setDiscoveringMarkets(false)
+      setDiscoveredMarketsError('')
+      setDiscoveredVaultMarkets([])
+      setDiscoveredMarketsChainId(null)
+      return
+    }
+
+    let cancelled = false
+
+    void (async () => {
+      setDiscoveringMarkets(true)
+      setDiscoveredMarketsError('')
+
+      try {
+        const markets = await discoverErc4626MarketsOnChain({
+          provider: selectedProvider.provider,
+          chainId,
+        })
+        if (cancelled) return
+
+        setDiscoveredVaultMarkets(markets)
+        setDiscoveredMarketsChainId(chainId)
+
+        if (markets.length === 0) {
+          setDiscoveredMarketsError(
+            'No ERC-4626 collateral markets with vault asset matching the loan token were found on this chain.',
+          )
+          return
+        }
+
+        const currentMarketId = marketIdInput.trim().toLowerCase()
+        if (discoveredMarketsChainId !== chainId || !markets.some((market) => market.marketId.toLowerCase() === currentMarketId)) {
+          applyDiscoveredMarket(markets[0])
+        }
+      } catch (error) {
+        if (cancelled) return
+        setDiscoveredVaultMarkets([])
+        setDiscoveredMarketsChainId(chainId)
+        setDiscoveredMarketsError(
+          error instanceof Error ? error.message : 'Failed to discover ERC-4626 markets on the current chain.',
+        )
+      } finally {
+        if (!cancelled) setDiscoveringMarkets(false)
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [selectedProvider, isCurrentChainSupported, chainId])
 
   useEffect(() => {
     if (builderMode !== 'deposit' || !baseSnapshot) return
@@ -455,8 +598,14 @@ export function BundlerApp() {
       if (!account) {
         return { error: 'Connect a wallet to build the bundle.', plan: null, warnings: [] }
       }
-      if (chainId !== MAINNET_CHAIN_ID) {
-        return { error: 'Switch to Ethereum mainnet to build the bundle.', plan: null, warnings: [] }
+      if (!isCurrentChainSupported) {
+        return {
+          error: currentMorphoChain
+            ? 'The current chain is not supported by the installed Morpho SDK.'
+            : morphoChainsError || 'Switch to a Morpho-supported chain to build the bundle.',
+          plan: null,
+          warnings: [],
+        }
       }
       if (!baseSnapshot) {
         return { error: snapshotError || 'Refresh the onchain snapshot first.', plan: null, warnings: [] }
@@ -694,12 +843,15 @@ export function BundlerApp() {
     chainId,
     collateralToken,
     collateralTokenDecimals,
+    currentMorphoChain,
     depositSlippageBps,
     flashAssets,
     irm,
+    isCurrentChainSupported,
     loanToken,
     loanTokenDecimals,
     lltv,
+    morphoChainsError,
     oracle,
     redeemSlippageBps,
     repayAssets,
@@ -749,23 +901,6 @@ export function BundlerApp() {
       setStatus({
         tone: 'error',
         text: error instanceof Error ? error.message : 'Failed to connect wallet.',
-      })
-    }
-  }
-
-  async function switchToMainnet() {
-    if (!selectedProvider) return
-
-    try {
-      await selectedProvider.provider.request({
-        method: 'wallet_switchEthereumChain',
-        params: [{ chainId: numberToHex(MAINNET_CHAIN_ID) }],
-      })
-      setStatus({ tone: 'success', text: 'Switched wallet to Ethereum mainnet.' })
-    } catch (error) {
-      setStatus({
-        tone: 'error',
-        text: error instanceof Error ? error.message : 'Failed to switch chain.',
       })
     }
   }
@@ -865,6 +1000,43 @@ export function BundlerApp() {
     }
   }
 
+  async function refreshDiscoveredVaultMarkets() {
+    if (!selectedProvider || !isCurrentChainSupported) return
+
+    setDiscoveringMarkets(true)
+    setDiscoveredMarketsError('')
+
+    try {
+      const markets = await discoverErc4626MarketsOnChain({
+        provider: selectedProvider.provider,
+        chainId,
+      })
+
+      setDiscoveredVaultMarkets(markets)
+      setDiscoveredMarketsChainId(chainId)
+
+      if (markets.length === 0) {
+        setDiscoveredMarketsError(
+          'No ERC-4626 collateral markets with vault asset matching the loan token were found on this chain.',
+        )
+        return
+      }
+
+      const currentMarketId = marketIdInput.trim().toLowerCase()
+      if (discoveredMarketsChainId !== chainId || !markets.some((market) => market.marketId.toLowerCase() === currentMarketId)) {
+        applyDiscoveredMarket(markets[0])
+      }
+    } catch (error) {
+      setDiscoveredVaultMarkets([])
+      setDiscoveredMarketsChainId(chainId)
+      setDiscoveredMarketsError(
+        error instanceof Error ? error.message : 'Failed to discover ERC-4626 markets on the current chain.',
+      )
+    } finally {
+      setDiscoveringMarkets(false)
+    }
+  }
+
   async function sendBundle() {
     setStatus({
       tone: 'idle',
@@ -874,8 +1046,13 @@ export function BundlerApp() {
       setStatus({ tone: 'error', text: 'Connect a wallet before sending the bundle.' })
       return
     }
-    if (chainId !== MAINNET_CHAIN_ID) {
-      setStatus({ tone: 'error', text: 'Switch to Ethereum mainnet before sending.' })
+    if (!isCurrentChainSupported) {
+      setStatus({
+        tone: 'error',
+        text: currentMorphoChain
+          ? 'The current chain is not supported by the installed Morpho SDK.'
+          : morphoChainsError || 'Switch to a Morpho-supported chain before sending.',
+      })
       return
     }
 
@@ -1091,6 +1268,18 @@ export function BundlerApp() {
     setIrm(snapshot.marketParams.irm)
     setLltv(snapshot.marketParams.lltv.toString())
     setVaultAddress(snapshot.marketParams.collateralToken)
+  }
+
+  function applyDiscoveredMarket(market: DiscoveredVaultMarket) {
+    setMarketIdInput(market.marketId)
+    setLoanToken(market.marketParams.loanToken)
+    setCollateralToken(market.marketParams.collateralToken)
+    setOracle(market.marketParams.oracle)
+    setIrm(market.marketParams.irm)
+    setLltv(market.marketParams.lltv.toString())
+    setLoanTokenDecimals(String(market.loanTokenDecimals))
+    setCollateralTokenDecimals(String(market.collateralTokenDecimals))
+    setVaultAddress(market.vaultAddress)
   }
 
   function applyRepayFraction(numerator: bigint, denominator: bigint) {
@@ -1443,26 +1632,35 @@ export function BundlerApp() {
 
           <div className="wallet-grid">
             <Stat label="Account" value={account || 'Not connected'} monospace />
-            <Stat label="Chain" value={`${chainId} (${numberToHex(chainId)})`} monospace />
-            <Stat label="Morpho" value={ETHEREUM_MORPHO} monospace />
+            <Stat
+              label="Chain"
+              value={
+                currentMorphoChain
+                  ? `${currentMorphoChain.network} (${chainId}, ${numberToHex(chainId)})`
+                  : `${chainId} (${numberToHex(chainId)})`
+              }
+              monospace
+            />
+            <Stat label="Morpho" value={currentMorphoAddress || 'Unsupported chain'} monospace />
             <Stat label="Last tx hash" value={lastTxHash || 'None'} monospace />
           </div>
 
           <div className="actions">
-            <button className="primary-button" onClick={switchToMainnet} type="button" disabled={!selectedProvider}>
-              Switch to mainnet
-            </button>
             <button
-              className="ghost-button"
+              className="primary-button"
               onClick={refreshBaseSnapshot}
               type="button"
-              disabled={!selectedProvider || !account || refreshingSnapshot || chainId !== MAINNET_CHAIN_ID}
+              disabled={!selectedProvider || !account || refreshingSnapshot || !isCurrentChainSupported}
             >
               {refreshingSnapshot ? 'Refreshing…' : 'Refresh snapshot'}
             </button>
           </div>
 
           <div className="note">
+            <p>
+              <strong>Chain support.</strong> The builder now follows Morpho&apos;s official Blue API chain list and uses the
+              current wallet chain. {currentMorphoChain ? `Current chain: ${currentMorphoChain.network}.` : 'Current chain is not listed by Morpho.'}
+            </p>
             <p>
               <strong>Trust model.</strong> No implementation deployment, no permanent account delegation, and no 7702
               code path. The only temporary privilege is Morpho authorization for <code>GeneralAdapter1</code>.
@@ -1579,43 +1777,50 @@ export function BundlerApp() {
 
         <section className="panel">
           <div className="panel__heading">
-            <h2>Market</h2>
-            <button
-              className="ghost-button"
-              onClick={() => {
-                setMarketIdInput(SUSDF_USDF_ETHEREUM_MARKET_ID)
-                setLoanToken(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.loanToken)
-                setCollateralToken(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.collateralToken)
-                setOracle(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.oracle)
-                setIrm(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.irm)
-                setLltv(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.lltv.toString())
-                setVaultAddress(SUSDF_USDF_ETHEREUM_MARKET_PARAMS.collateralToken)
-              }}
-              type="button"
-            >
-              Load sUSDf/USDf preset
-            </button>
+            <h2>Market Discovery</h2>
+            <span className="pill">{currentChainLabel}</span>
           </div>
 
-          {resolvingMarketConfig ? (
-            <div className="warning">Resolving market parameters from Market ID...</div>
-          ) : null}
-          {marketConfigError ? <div className="warning">{marketConfigError}</div> : null}
+          <MarketSelector
+            markets={discoveredVaultMarkets}
+            selectedMarketId={selectedDiscoveredMarketId}
+            chainLabel={currentChainLabel}
+            helperText={marketSelectorHelperText}
+            discovering={discoveringMarkets}
+            discoveredMarketsError={discoveredMarketsError}
+            resolvingMarketConfig={resolvingMarketConfig}
+            marketConfigError={marketConfigError}
+            refreshDisabled={!selectedProvider || !isCurrentChainSupported || discoveringMarkets}
+            onRefresh={() => void refreshDiscoveredVaultMarkets()}
+            onSelectMarket={applyDiscoveredMarket}
+          />
+        </section>
 
-          <div className="two-col">
-            <TextField label="Market ID" value={marketIdInput} onChange={setMarketIdInput} />
-            <TextField label="Loan token" value={loanToken} onChange={setLoanToken} />
-            <TextField label="Collateral token" value={collateralToken} onChange={setCollateralToken} />
-            <TextField label="Oracle" value={oracle} onChange={setOracle} />
-            <TextField label="IRM" value={irm} onChange={setIrm} />
-            <TextField label="LLTV (wad)" value={lltv} onChange={setLltv} />
-            <TextField label="Loan token decimals" value={loanTokenDecimals} onChange={setLoanTokenDecimals} />
-            <TextField
-              label="Collateral token decimals"
-              value={collateralTokenDecimals}
-              onChange={setCollateralTokenDecimals}
-            />
-            <TextField label="ERC-4626 vault" value={vaultAddress} onChange={setVaultAddress} />
+        <section className="panel">
+          <div className="panel__heading">
+            <h2>Market Config</h2>
+            <span className="pill pill--soft">Manual override</span>
+          </div>
+
+          <div className="market-manual">
+            <p className="market-manual__copy">
+              Paste or edit market parameters directly when you want a custom market instead of the discovered list.
+            </p>
+            <div className="market-manual__fields">
+              <TextField label="Market ID" value={marketIdInput} onChange={setMarketIdInput} />
+              <TextField label="Loan token" value={loanToken} onChange={setLoanToken} />
+              <TextField label="Collateral token" value={collateralToken} onChange={setCollateralToken} />
+              <TextField label="Oracle" value={oracle} onChange={setOracle} />
+              <TextField label="IRM" value={irm} onChange={setIrm} />
+              <TextField label="LLTV (wad)" value={lltv} onChange={setLltv} />
+              <TextField label="Loan token decimals" value={loanTokenDecimals} onChange={setLoanTokenDecimals} />
+              <TextField
+                label="Collateral token decimals"
+                value={collateralTokenDecimals}
+                onChange={setCollateralTokenDecimals}
+              />
+              <TextField label="ERC-4626 vault" value={vaultAddress} onChange={setVaultAddress} />
+            </div>
           </div>
         </section>
 
@@ -1841,7 +2046,7 @@ export function BundlerApp() {
             )}
             <p>
               <strong>Vault requirement.</strong> The ERC-4626 vault asset must be the same token as the Morpho loan
-              token. For this preset, both are <code>USDf</code>.
+              token. The discovered market list only keeps markets where this holds on-chain.
             </p>
           </div>
         </section>
@@ -2226,7 +2431,6 @@ async function fetchBaseSnapshot(parameters: {
   chainId: number
 }): Promise<BaseSnapshot> {
   const client = createPublicClient({
-    chain: mainnet,
     transport: custom(parameters.provider),
   })
 
@@ -2301,7 +2505,6 @@ async function fetchMarketConfigById(parameters: {
   chainId: number
 }): Promise<ResolvedMarketConfig> {
   const client = createPublicClient({
-    chain: mainnet,
     transport: custom(parameters.provider),
   })
 
@@ -2334,7 +2537,6 @@ async function fetchVaultSnapshot(parameters: {
   assets: bigint
 }): Promise<VaultSnapshot> {
   const client = createPublicClient({
-    chain: mainnet,
     transport: custom(parameters.provider),
   })
 
@@ -2383,7 +2585,6 @@ async function signTypedDataWithProvider(
   try {
     const client = createWalletClient({
       account,
-      chain: mainnet,
       transport: custom(provider),
     })
 

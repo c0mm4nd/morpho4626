@@ -259,6 +259,206 @@ textarea,
   margin-bottom: 16px;
 }
 
+.market-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.market-selector__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.market-selector__header h3,
+.market-group__header h4 {
+  margin: 0;
+  letter-spacing: -0.02em;
+}
+
+.market-selector__header p,
+.market-group__description {
+  margin: 8px 0 0;
+  color: rgba(17, 32, 23, 0.7);
+}
+
+.market-selector__summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.market-selector__groups {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.market-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  padding: 16px;
+  border: 1px solid rgba(17, 32, 23, 0.12);
+  border-radius: 24px;
+  background: rgba(246, 249, 241, 0.78);
+}
+
+.market-group__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.market-group__empty {
+  padding: 16px;
+  border-radius: 18px;
+  background: rgba(17, 32, 23, 0.05);
+  color: rgba(17, 32, 23, 0.6);
+}
+
+.market-group__list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 620px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.market-card {
+  border: 1px solid rgba(17, 32, 23, 0.12);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.92);
+  padding: 16px;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    transform 120ms ease,
+    background 120ms ease;
+}
+
+.market-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(36, 94, 107, 0.28);
+}
+
+.market-card--selected {
+  border-color: rgba(31, 143, 99, 0.52);
+  box-shadow: 0 0 0 4px rgba(47, 159, 102, 0.12);
+  background: rgba(239, 248, 242, 0.96);
+}
+
+.market-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.market-card__title {
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.market-card__subtitle {
+  margin-top: 4px;
+  color: rgba(17, 32, 23, 0.64);
+}
+
+.market-card__size {
+  font-size: 1rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.market-card__badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.market-card__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: rgba(17, 32, 23, 0.08);
+  color: rgba(17, 32, 23, 0.74);
+  font-size: 0.8rem;
+}
+
+.market-card__badge--active {
+  background: rgba(31, 143, 99, 0.14);
+  color: #1c6d4c;
+}
+
+.market-card__meta,
+.market-card__address-grid {
+  display: grid;
+  gap: 10px 14px;
+}
+
+.market-card__meta {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.market-card__address-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.market-card__meta-row,
+.market-card__address {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.market-card__meta-label {
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(17, 32, 23, 0.52);
+}
+
+.market-card__meta-value {
+  color: #112017;
+  word-break: break-word;
+}
+
+.market-card__address-value {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.86rem;
+  color: #22392a;
+  word-break: break-all;
+}
+
+.market-manual {
+  display: flex;
+  flex-direction: column;
+}
+
+.market-manual__copy {
+  margin: 0 0 18px;
+  color: rgba(17, 32, 23, 0.68);
+}
+
+.market-manual__fields {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0 16px;
+}
+
 .primary-button,
 .ghost-button {
   border: 0;
@@ -328,7 +528,10 @@ textarea,
   .hero,
   .grid,
   .two-col,
-  .wallet-grid {
+  .wallet-grid,
+  .market-selector__groups,
+  .market-card__meta,
+  .market-card__address-grid {
     grid-template-columns: 1fr;
   }
 
@@ -345,5 +548,12 @@ textarea,
   .status-card,
   .panel {
     border-radius: 24px;
+  }
+
+  .market-selector__header,
+  .market-group__header,
+  .market-card__header {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }
