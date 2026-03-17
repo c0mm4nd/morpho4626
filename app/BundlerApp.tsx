@@ -1598,9 +1598,9 @@ export function BundlerApp() {
           <p className="eyebrow">Morpho x Bundler3</p>
           <h1>Single-transaction flash-loan redeem / deposit builder</h1>
           <p className="lede">
-            This version drops ERC-7702 entirely. It signs Morpho <code>setAuthorizationWithSig</code> off-chain, runs
-            either a flash-loan exit or a flash-loan leveraged deposit through Morpho&apos;s <code>Bundler3</code>,
-            optionally revokes authorization at the end, and submits one normal Ethereum transaction.
+            Sign Morpho <code>setAuthorizationWithSig</code> off-chain, run either a flash-loan exit or leveraged
+            deposit through <code>Bundler3</code>, optionally revoke at the end, and submit one normal Ethereum
+            transaction.
           </p>
         </div>
         <div className={`status-card status-card--${status.tone}`}>
@@ -1662,8 +1662,7 @@ export function BundlerApp() {
               current wallet chain. {currentMorphoChain ? `Current chain: ${currentMorphoChain.network}.` : 'Current chain is not listed by Morpho.'}
             </p>
             <p>
-              <strong>Trust model.</strong> No implementation deployment, no permanent account delegation, and no 7702
-              code path. The only temporary privilege is Morpho authorization for <code>GeneralAdapter1</code>.
+              <strong>Trust model.</strong> The only temporary privilege is Morpho authorization for <code>GeneralAdapter1</code>.
             </p>
             <p>
               <strong>Recommended mode.</strong> Keep <code>Auto revoke</code> enabled so the authorization is removed at

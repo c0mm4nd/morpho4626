@@ -1,13 +1,6 @@
 import type { Address } from 'viem'
 
-import {
-  EXIT_MODE_ERC4626_REDEEM,
-  REPAY_MODE_EXACT_ASSETS,
-  REPAY_MODE_FULL_SHARES,
-  WITHDRAW_ALL_COLLATERAL,
-  type FlashPlanInput,
-  type MarketParams,
-} from './morpho7702.js'
+import type { MarketParams } from './morphoBundlerOfficial.js'
 
 export const ETHEREUM_MORPHO = '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb' as Address
 
@@ -20,36 +13,4 @@ export const SUSDF_USDF_ETHEREUM_MARKET_PARAMS: MarketParams = {
   oracle: '0x84bf7A62708108fA640292684F04b0f7362C88F9',
   irm: '0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC',
   lltv: 915000000000000000n,
-}
-
-export function buildSusdfUsdfRedeemAllPlan(parameters: {
-  maxFlashAssets: bigint
-  minUsdfProfit?: bigint
-}): FlashPlanInput {
-  return {
-    marketParams: SUSDF_USDF_ETHEREUM_MARKET_PARAMS,
-    flashAssets: parameters.maxFlashAssets,
-    repayMode: REPAY_MODE_FULL_SHARES,
-    withdrawCollateralAssets: WITHDRAW_ALL_COLLATERAL,
-    minLoanTokenProfit: parameters.minUsdfProfit ?? 0n,
-    exitMode: EXIT_MODE_ERC4626_REDEEM,
-    exitTarget: SUSDF_USDF_ETHEREUM_MARKET_PARAMS.collateralToken,
-  }
-}
-
-export function buildSusdfUsdfRedeemPartialPlan(parameters: {
-  repayAssets: bigint
-  withdrawSusdfAssets: bigint
-  minUsdfProfit?: bigint
-}): FlashPlanInput {
-  return {
-    marketParams: SUSDF_USDF_ETHEREUM_MARKET_PARAMS,
-    flashAssets: parameters.repayAssets,
-    repayMode: REPAY_MODE_EXACT_ASSETS,
-    repayAssets: parameters.repayAssets,
-    withdrawCollateralAssets: parameters.withdrawSusdfAssets,
-    minLoanTokenProfit: parameters.minUsdfProfit ?? 0n,
-    exitMode: EXIT_MODE_ERC4626_REDEEM,
-    exitTarget: SUSDF_USDF_ETHEREUM_MARKET_PARAMS.collateralToken,
-  }
 }
