@@ -1,0 +1,34 @@
+{
+  "name": "morphopai",
+  "version": "1.0.0",
+  "description": "Bundler3 transaction builder for Morpho flash-loan redeem flows",
+  "main": "dist/sdk/index.js",
+  "scripts": {
+    "build:sdk": "tsc -p tsconfig.json",
+    "build:web": "vite build",
+    "build": "npm run build:sdk && npm run build:web",
+    "dev": "vite",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@morpho-org/blue-sdk": "^5.18.0",
+    "@morpho-org/blue-sdk-viem": "^4.5.0",
+    "@morpho-org/bundler-sdk-viem": "^4.3.2",
+    "@morpho-org/morpho-ts": "^2.5.0",
+    "@morpho-org/simulation-sdk": "^3.4.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "viem": "^2.47.4"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.0.0"
+  }
+}
