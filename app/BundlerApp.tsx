@@ -161,6 +161,16 @@ type DepositRiskConstraints = {
 
 type ExecutionPreview = RedeemExecutionPreview | DepositExecutionPreview
 
+type RedeemAutoPoint = {
+  fractionWad: bigint
+  repayMode: RepayMode
+  repayAssets: bigint
+  withdrawCollateral: bigint
+  flashAssets: bigint
+  ltvAfter: bigint | null
+  healthAfter: bigint | null
+}
+
 type DraftState = {
   error: string
   plan:
@@ -252,6 +262,13 @@ export function BundlerApp() {
   const [depositAutoLeverageIndex, setDepositAutoLeverageIndex] = useState<number>(0)
   const [depositAutoLeverageLoading, setDepositAutoLeverageLoading] = useState<boolean>(false)
   const [depositAutoLeverageError, setDepositAutoLeverageError] = useState<string>('')
+
+  const [redeemAutoPoints, setRedeemAutoPoints] = useState<RedeemAutoPoint[]>([])
+  const [redeemAutoIndex, setRedeemAutoIndex] = useState<number>(20)
+  const [redeemAutoLoading, setRedeemAutoLoading] = useState<boolean>(false)
+  const [redeemAutoError, setRedeemAutoError] = useState<string>('')
+  const [redeemMaxLtvAfter, setRedeemMaxLtvAfter] = useState<string>('')
+  const [redeemMinHealthAfter, setRedeemMinHealthAfter] = useState<string>('')
 
   const selectedProvider = providers.find((provider) => provider.id === selectedProviderId) ?? null
   const currentMorphoChain = morphoChains.find((chain) => chain.id === chainId) ?? null
@@ -698,6 +715,77 @@ export function BundlerApp() {
     )
   }, [baseSnapshot, builderMode, depositAutoLeverageIndex, depositAutoLeveragePoints])
 
+  // Compute redeem auto points whenever relevant inputs change
+  useEffect(() => {
+    if (builderMode !== 'redeem') {
+      setRedeemAutoPoints([])
+      setRedeemAutoIndex(20)
+      setRedeemAutoLoading(false)
+      setRedeemAutoError('')
+      return
+    }
+    if (!baseSnapshot || baseSnapshot.borrowAssets <= 0n) {
+      setRedeemAutoPoints([])
+      setRedeemAutoIndex(20)
+      setRedeemAutoLoading(false)
+      return
+    }
+
+    let cancelled = false
+    setRedeemAutoLoading(true)
+    setRedeemAutoError('')
+
+    const timeoutId = window.setTimeout(() => {
+      try {
+        const riskConstraints = {
+          maxLtvAfter: parseOptionalPercentWad(redeemMaxLtvAfter, 'Max LTV after'),
+          minHealthAfter: parseOptionalFactorWad(redeemMinHealthAfter, 'Min health after'),
+        }
+        const points = computeRedeemAutoPoints({
+          snapshot: baseSnapshot,
+          flashBufferBps: parseBps(flashBufferBps),
+          riskConstraints,
+        })
+        if (cancelled) return
+        setRedeemAutoPoints(points)
+        if (points.length === 0) {
+          setRedeemAutoError('No feasible exit point satisfies the current constraints.')
+        } else {
+          setRedeemAutoIndex((prev) => clampNumber(prev, 0, points.length - 1))
+        }
+      } catch (error) {
+        if (cancelled) return
+        setRedeemAutoError(error instanceof Error ? error.message : 'Failed to compute redeem points.')
+        setRedeemAutoPoints([])
+      } finally {
+        if (!cancelled) setRedeemAutoLoading(false)
+      }
+    }, 200)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timeoutId)
+    }
+  }, [builderMode, baseSnapshot, redeemMaxLtvAfter, redeemMinHealthAfter, flashBufferBps])
+
+  // Sync redeem slider index → repay/withdraw state
+  useEffect(() => {
+    if (builderMode !== 'redeem' || !baseSnapshot || redeemAutoPoints.length === 0) return
+    const point = redeemAutoPoints[clampNumber(redeemAutoIndex, 0, redeemAutoPoints.length - 1)]
+    if (!point) return
+
+    const nextRepayAssets = formatUnits(point.repayAssets, baseSnapshot.loanTokenDecimals)
+    const nextFlashAssets = formatUnits(point.flashAssets, baseSnapshot.loanTokenDecimals)
+    const nextWithdrawCollateral = formatUnits(point.withdrawCollateral, baseSnapshot.collateralTokenDecimals)
+    const nextWithdrawAll = point.withdrawCollateral >= baseSnapshot.collateral
+
+    setRepayMode(point.repayMode)
+    setRepayAssets((v) => (v === nextRepayAssets ? v : nextRepayAssets))
+    setFlashAssets((v) => (v === nextFlashAssets ? v : nextFlashAssets))
+    setWithdrawAllCollateral(nextWithdrawAll)
+    setWithdrawCollateralAssets((v) => (v === nextWithdrawCollateral ? v : nextWithdrawCollateral))
+  }, [builderMode, redeemAutoIndex, redeemAutoPoints, baseSnapshot])
+
   useEffect(() => {
     if (builderMode !== 'deposit') {
       setTargetUtilizationAfter('')
@@ -714,6 +802,15 @@ export function BundlerApp() {
     builderMode === 'deposit'
       ? depositAutoLeveragePoints[clampNumber(depositAutoLeverageIndex, 0, depositAutoLeveragePoints.length - 1)] ?? null
       : null
+
+  const activeRedeemAutoPoint =
+    builderMode === 'redeem'
+      ? redeemAutoPoints[clampNumber(redeemAutoIndex, 0, redeemAutoPoints.length - 1)] ?? null
+      : null
+  const redeemAutoProgress =
+    redeemAutoPoints.length > 1
+      ? (clampNumber(redeemAutoIndex, 0, redeemAutoPoints.length - 1) / (redeemAutoPoints.length - 1)) * 100
+      : 0
 
   const draft = useMemo<DraftState>(() => {
     try {
@@ -761,7 +858,7 @@ export function BundlerApp() {
       }
       if (
         builderMode === 'redeem' &&
-        (!vaultSnapshot?.asset || vaultSnapshot.asset.toLowerCase() != marketParams.loanToken.toLowerCase())
+        (!vaultSnapshot?.asset || vaultSnapshot.asset.toLowerCase() !== marketParams.loanToken.toLowerCase())
       ) {
         throw new Error('The ERC-4626 vault asset must match the Morpho loan token for this builder.')
       }
@@ -1254,6 +1351,7 @@ export function BundlerApp() {
             })
 
       if (!freshVaultSnapshot.asset || freshVaultSnapshot.asset.toLowerCase() !== marketParams.loanToken.toLowerCase()) {
+
         throw new Error('The ERC-4626 vault asset must match the Morpho loan token for this builder.')
       }
 
@@ -1851,326 +1949,406 @@ export function BundlerApp() {
   }
 
   return (
-    <div className="shell">
-      <header className="hero">
-        <div className="hero__copy">
-          <p className="eyebrow">morpho4626</p>
-          <h1>Single-transaction flash-loan redeem / deposit builder</h1>
-          <p className="lede">
-            Sign Morpho <code>setAuthorizationWithSig</code> off-chain, run either a flash-loan exit or leveraged
-            deposit through <code>Bundler3</code>, optionally revoke at the end, and submit one normal Ethereum
-            transaction.
-          </p>
+    <div className="admin-shell">
+      {/* ── Top bar ── */}
+      <header className="topbar">
+        <div className="topbar__brand">
+          <span className="topbar__name">morpho4626</span>
+          <span className="topbar__tag">Bundler3 Flash Engine</span>
         </div>
-        <div className={`status-card status-card--${status.tone}`}>
-          <span className="status-card__label">Status</span>
-          <p>{status.text}</p>
+        <div className={`topbar__chip ${isCurrentChainSupported ? 'topbar__chip--ok' : 'topbar__chip--warn'}`}>
+          <span className={`topbar__dot ${isCurrentChainSupported ? '' : 'topbar__dot--warn'}`} />
+          {currentMorphoChain ? currentMorphoChain.network : `Chain ${chainId}`}
         </div>
+        <div className="topbar__chip">
+          {account ? `${account.slice(0, 6)}…${account.slice(-4)}` : 'Not connected'}
+        </div>
+        <button className="topbar__connect-btn" onClick={connectWallet} type="button">
+          {account ? 'Reconnect' : 'Connect wallet'}
+        </button>
       </header>
 
-      <main className="grid">
-        <section className="panel">
-          <div className="panel__heading">
-            <h2>Wallet</h2>
-            <button className="ghost-button" onClick={connectWallet} type="button">
-              {account ? 'Reconnect' : 'Connect'}
-            </button>
-          </div>
+      {/* ── Sidebar ── */}
+      <nav className="sidebar">
+        <div className="workflow-label">Workflow</div>
+        <div className="workflow-steps">
 
-          <label className="field">
-            <span>Injected provider</span>
-            <select value={selectedProviderId} onChange={(event) => setSelectedProviderId(event.target.value)}>
-              {providers.length === 0 ? <option>No injected provider found</option> : null}
-              {providers.map((provider) => (
-                <option key={provider.id} value={provider.id}>
-                  {provider.label}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <div className="wallet-grid">
-            <Stat label="Account" value={account || 'Not connected'} monospace />
-            <Stat
-              label="Chain"
-              value={
-                currentMorphoChain
-                  ? `${currentMorphoChain.network} (${chainId}, ${numberToHex(chainId)})`
-                  : `${chainId} (${numberToHex(chainId)})`
-              }
-              monospace
-            />
-            <Stat label="Morpho" value={currentMorphoAddress || 'Unsupported chain'} monospace />
-            <Stat label="Last tx hash" value={lastTxHash || 'None'} monospace />
-          </div>
-
-          <div className="actions">
-            <button
-              className="primary-button"
-              onClick={refreshBaseSnapshot}
-              type="button"
-              disabled={!selectedProvider || !account || refreshingSnapshot || !isCurrentChainSupported}
-            >
-              {refreshingSnapshot ? 'Refreshing…' : 'Refresh snapshot'}
-            </button>
-          </div>
-
-          <div className="note">
-            <p>
-              <strong>Chain support.</strong> The builder now follows Morpho&apos;s official Blue API chain list and uses the
-              current wallet chain. {currentMorphoChain ? `Current chain: ${currentMorphoChain.network}.` : 'Current chain is not listed by Morpho.'}
-            </p>
-            <p>
-              <strong>Trust model.</strong> The only temporary privilege is Morpho authorization for <code>GeneralAdapter1</code>.
-            </p>
-            <p>
-              <strong>Recommended mode.</strong> Keep <code>Auto revoke</code> enabled so the authorization is removed at
-              the end of the same transaction.
-            </p>
-          </div>
-        </section>
-
-        <section className="panel">
-          <div className="panel__heading">
-            <h2>Snapshot</h2>
-            <span className="pill">{baseSnapshot ? 'On-chain' : 'Pending'}</span>
-          </div>
-
-          <div className="wallet-grid">
-            <Stat label="Market ID" value={baseSnapshot?.marketId || marketIdInput || 'Not loaded'} monospace />
-            <Stat
-              label="Borrow shares"
-              value={baseSnapshot ? baseSnapshot.borrowShares.toString() : snapshotError || 'Not loaded'}
-              monospace
-            />
-            <Stat
-              label="Borrow assets"
-              value={
-                baseSnapshot
-                  ? `${formatUnits(baseSnapshot.borrowAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
-                  : 'Not loaded'
-              }
-            />
-            <Stat
-              label="Collateral"
-              value={
-                baseSnapshot
-                  ? `${formatUnits(baseSnapshot.collateral, baseSnapshot.collateralTokenDecimals)} ${baseSnapshot.collateralTokenSymbol}`
-                  : 'Not loaded'
-              }
-            />
-            <Stat
-              label="Current LTV"
-              value={baseSnapshot ? formatWadPercent(baseSnapshot.accrualPosition.ltv) : 'Not loaded'}
-            />
-            <Stat
-              label="Health factor"
-              value={baseSnapshot ? formatFactor(baseSnapshot.accrualPosition.healthFactor) : 'Not loaded'}
-            />
-            <Stat
-              label="Borrow APY now"
-              value={baseSnapshot ? formatPercent(baseSnapshot.market.borrowApy) : 'Not loaded'}
-            />
-            <Stat
-              label="Supply APY now"
-              value={baseSnapshot ? formatPercent(baseSnapshot.market.supplyApy) : 'Not loaded'}
-            />
-            <Stat
-              label="Utilization now"
-              value={baseSnapshot ? formatWadPercent(baseSnapshot.market.utilization) : 'Not loaded'}
-            />
-            <Stat
-              label="Full repay estimate"
-              value={
-                baseSnapshot
-                  ? `${formatUnits(baseSnapshot.estimatedFullRepayAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
-                  : 'Not loaded'
-              }
-            />
-            <Stat
-              label="Max flash loan"
-              value={
-                baseSnapshot
-                  ? `${formatUnits(baseSnapshot.maxFlashLoanAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
-                  : 'Not loaded'
-              }
-            />
-            <Stat
-              label="Morpho nonce"
-              value={baseSnapshot ? baseSnapshot.morphoNonce.toString() : 'Not loaded'}
-              monospace
-            />
-            <Stat
-              label="Wallet loan balance"
-              value={
-                baseSnapshot
-                  ? `${formatUnits(baseSnapshot.walletLoanTokenBalance, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
-                  : 'Not loaded'
-              }
-            />
-            <Stat
-              label="Adapter allowance"
-              value={
-                baseSnapshot
-                  ? `${formatUnits(baseSnapshot.walletLoanTokenAllowanceToAdapter, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
-                  : 'Not loaded'
-              }
-            />
-            <Stat label="GeneralAdapter1" value={baseSnapshot?.generalAdapter1 || 'Not loaded'} monospace />
-            <Stat label="Bundler3" value={baseSnapshot?.bundler3 || 'Not loaded'} monospace />
-            <Stat label="Authorized now" value={baseSnapshot ? (baseSnapshot.isBundlerAuthorized ? 'Yes' : 'No') : 'Unknown'} />
-            <Stat
-              label="Vault asset"
-              value={vaultSnapshot?.asset || vaultError || 'Not loaded'}
-              monospace={Boolean(vaultSnapshot?.asset || vaultError)}
-            />
-          </div>
-
-          {builderMode === 'redeem' && baseSnapshot && baseSnapshot.borrowShares === 0n && baseSnapshot.collateral === 0n ? (
-            <div className="warning">The connected account has no position on the selected Morpho market.</div>
-          ) : null}
-          {snapshotError ? <div className="warning">{snapshotError}</div> : null}
-          {vaultError ? <div className="warning">{vaultError}</div> : null}
-        </section>
-
-        <section className="panel">
-          <div className="panel__heading">
-            <h2>Market Discovery</h2>
-            <span className="pill">{currentChainLabel}</span>
-          </div>
-
-          <MarketSelector
-            markets={discoveredVaultMarkets}
-            selectedMarketId={selectedDiscoveredMarketId}
-            chainLabel={currentChainLabel}
-            helperText={marketSelectorHelperText}
-            hasLoadedMarkets={hasDiscoveredMarketsForCurrentChain}
-            discovering={discoveringMarkets}
-            discoveredMarketsError={discoveredMarketsError}
-            refreshDisabled={!selectedProvider || !isCurrentChainSupported || discoveringMarkets}
-            onRefresh={() => void refreshDiscoveredVaultMarkets()}
-            onSelectMarket={applyDiscoveredMarket}
-          />
-        </section>
-
-        <section className="panel">
-          <div className="panel__heading">
-            <h2>Market Config</h2>
-            <span className="pill pill--soft">Auto fill from Market ID</span>
-          </div>
-
-          <div className="market-manual">
-            <p className="market-manual__copy">
-              Paste a Morpho Market ID. The app resolves loan token, collateral token, oracle, IRM, decimals, and vault
-              automatically on the active chain.
-            </p>
-            <div className="market-manual__fields">
-              <TextField label="Market ID" value={marketIdInput} onChange={setMarketIdInput} />
+          {/* Step 1: Connect */}
+          <a className={`workflow-step ${account ? 'workflow-step--done' : 'workflow-step--active'}`} href="#snapshot">
+            <span className="workflow-step__badge">{account ? '✓' : '1'}</span>
+            <div className="workflow-step__content">
+              <div className="workflow-step__title">Connect Wallet</div>
+              <div className="workflow-step__sub">{account ? `${account.slice(0,6)}…${account.slice(-4)}` : 'Not connected'}</div>
             </div>
-            {resolvingMarketConfig ? <div className="warning">Resolving market parameters from Market ID...</div> : null}
-            {marketConfigError ? <div className="warning">{marketConfigError}</div> : null}
-            <div className="wallet-grid">
-              <Stat label="Loan token" value={hasResolvedCurrentMarketConfig ? loanToken : 'Not resolved'} monospace />
-              <Stat
-                label="Collateral token"
-                value={hasResolvedCurrentMarketConfig ? collateralToken : 'Not resolved'}
-                monospace
-              />
-              <Stat label="Oracle" value={hasResolvedCurrentMarketConfig ? oracle : 'Not resolved'} monospace />
-              <Stat label="IRM" value={hasResolvedCurrentMarketConfig ? irm : 'Not resolved'} monospace />
-              <Stat label="LLTV (wad)" value={hasResolvedCurrentMarketConfig ? lltv : 'Not resolved'} monospace />
-              <Stat
-                label="Loan token decimals"
-                value={hasResolvedCurrentMarketConfig ? loanTokenDecimals : 'Not resolved'}
-              />
-              <Stat
-                label="Collateral token decimals"
-                value={hasResolvedCurrentMarketConfig ? collateralTokenDecimals : 'Not resolved'}
-              />
-              <Stat
-                label="ERC-4626 vault"
-                value={hasResolvedCurrentMarketConfig ? vaultAddress : 'Not resolved'}
-                monospace
-              />
+            <span className="workflow-step__line" />
+          </a>
+
+          {/* Step 2: Select Market */}
+          <a className={`workflow-step ${hasResolvedCurrentMarketConfig ? 'workflow-step--done' : account ? 'workflow-step--active' : ''}`} href="#market">
+            <span className="workflow-step__badge">{hasResolvedCurrentMarketConfig ? '✓' : '2'}</span>
+            <div className="workflow-step__content">
+              <div className="workflow-step__title">Select Market</div>
+              <div className="workflow-step__sub">{hasResolvedCurrentMarketConfig ? 'Market loaded' : 'Browse or paste ID'}</div>
             </div>
-          </div>
-        </section>
+            <span className="workflow-step__line" />
+          </a>
 
-        <section className="panel panel--wide">
-          <div className="panel__heading">
-            <h2>Plan</h2>
-            <span className="pill">
-              {builderMode === 'redeem'
-                ? repayMode === 'full-shares'
-                  ? 'Close by shares'
-                  : 'Repay exact assets'
-                : 'Leverage'}
-            </span>
-          </div>
+          {/* Step 3: Load Snapshot */}
+          <a className={`workflow-step ${baseSnapshot ? 'workflow-step--done' : hasResolvedCurrentMarketConfig ? 'workflow-step--active' : ''}`} href="#snapshot">
+            <span className="workflow-step__badge">{baseSnapshot ? '✓' : '3'}</span>
+            <div className="workflow-step__content">
+              <div className="workflow-step__title">Load Snapshot</div>
+              <div className="workflow-step__sub">
+                {baseSnapshot
+                  ? `${baseSnapshot.loanTokenSymbol} / ${baseSnapshot.collateralTokenSymbol}`
+                  : 'Refresh position'}
+              </div>
+            </div>
+            <span className="workflow-step__line" />
+          </a>
 
-          <div className="two-col">
+          {/* Step 4: Build Plan */}
+          <a className={`workflow-step ${draft.plan && !draft.error ? 'workflow-step--done' : baseSnapshot ? 'workflow-step--active' : ''}`} href="#plan">
+            <span className="workflow-step__badge">{draft.plan && !draft.error ? '✓' : '4'}</span>
+            <div className="workflow-step__content">
+              <div className="workflow-step__title">Build Plan</div>
+              <div className="workflow-step__sub">{builderMode === 'redeem' ? 'Flash-loan exit' : 'Leveraged deposit'}</div>
+            </div>
+            <span className="workflow-step__line" />
+          </a>
+
+          {/* Step 5: Sign & Send */}
+          <a className={`workflow-step ${lastTxHash ? 'workflow-step--done' : draft.plan && !draft.error ? 'workflow-step--active' : ''}`} href="#preview">
+            <span className="workflow-step__badge">{lastTxHash ? '✓' : '5'}</span>
+            <div className="workflow-step__content">
+              <div className="workflow-step__title">Sign &amp; Send</div>
+              <div className="workflow-step__sub">{lastTxHash ? 'Submitted' : 'Review and execute'}</div>
+            </div>
+          </a>
+
+        </div>
+
+        <div className="sidebar__divider" />
+        <div className="sidebar__section-label">Debug</div>
+        <a className="sidebar__item" href="#payloads">
+          <svg className="sidebar__item-icon" viewBox="0 0 16 16" fill="currentColor"><path d="M3 2h10l2 4v8H1V6zm2 1l-1 3h8l-1-3z"/></svg>
+          Payloads
+        </a>
+
+        <div className="sidebar__divider" />
+        <div className="sidebar__status">
+          <div className="sidebar__status-label">Status</div>
+          <div className={`sidebar__status-text sidebar__status-text--${status.tone}`}>{status.text}</div>
+        </div>
+      </nav>
+
+      {/* ── Main content ── */}
+      <main className="main-content">
+
+        {/* Workflow progress bar */}
+        <div className="progress-bar-wrap">
+          {[
+            { label: 'Connect', done: Boolean(account) },
+            { label: 'Market', done: hasResolvedCurrentMarketConfig },
+            { label: 'Snapshot', done: Boolean(baseSnapshot) },
+            { label: 'Plan', done: Boolean(draft.plan && !draft.error) },
+            { label: 'Send', done: Boolean(lastTxHash) },
+          ].map((step, i, arr) => (
+            <div key={step.label} className={`progress-step ${step.done ? 'progress-step--done' : i === arr.findIndex(s => !s.done) ? 'progress-step--active' : ''}`}>
+              <span className="progress-step__dot" />
+              <span className="progress-step__label">{step.label}</span>
+              {i < arr.length - 1 && <span className="progress-step__connector" />}
+            </div>
+          ))}
+        </div>
+
+        {lastTxHash ? (
+          <div className="status-banner status-banner--success">
+            ✓ Transaction submitted: <span className="mono">{lastTxHash}</span>
+          </div>
+        ) : null}
+
+        <div className="content-grid">
+
+          {/* ── Market Discovery ── */}
+          <section className="panel panel--wide" id="market">
+            <div className="panel__heading">
+              <div className="panel__heading-left">
+                <span className="step-num">2</span>
+                <h2>Select Market</h2>
+              </div>
+              <span className="pill">{currentChainLabel}</span>
+            </div>
+            <MarketSelector
+              markets={discoveredVaultMarkets}
+              selectedMarketId={selectedDiscoveredMarketId}
+              chainLabel={currentChainLabel}
+              helperText={marketSelectorHelperText}
+              hasLoadedMarkets={hasDiscoveredMarketsForCurrentChain}
+              discovering={discoveringMarkets}
+              discoveredMarketsError={discoveredMarketsError}
+              refreshDisabled={!selectedProvider || !isCurrentChainSupported || discoveringMarkets}
+              onRefresh={() => void refreshDiscoveredVaultMarkets()}
+              onSelectMarket={applyDiscoveredMarket}
+            />
+          </section>
+
+          {/* ── Market Config ── */}
+          <section className="panel" id="config">
+            <div className="panel__heading">
+              <div className="panel__heading-left">
+                <span className="step-num step-num--sub">2b</span>
+                <h2>Market Config</h2>
+              </div>
+              <span className="pill pill--soft">Auto-fill from ID</span>
+            </div>
+            <div className="market-manual">
+              <p className="market-manual__copy">
+                Paste a Morpho Market ID — loan token, collateral, oracle, IRM, decimals, and vault address are resolved automatically.
+              </p>
+              <div className="market-manual__fields">
+                <TextField label="Market ID" value={marketIdInput} onChange={setMarketIdInput} />
+              </div>
+              {resolvingMarketConfig ? <div className="warning">Resolving market parameters…</div> : null}
+              {marketConfigError ? <div className="warning">{marketConfigError}</div> : null}
+              <div className="wallet-grid">
+                <Stat label="Loan token" value={hasResolvedCurrentMarketConfig ? loanToken : '—'} monospace />
+                <Stat label="Collateral token" value={hasResolvedCurrentMarketConfig ? collateralToken : '—'} monospace />
+                <Stat label="Oracle" value={hasResolvedCurrentMarketConfig ? oracle : '—'} monospace />
+                <Stat label="IRM" value={hasResolvedCurrentMarketConfig ? irm : '—'} monospace />
+                <Stat label="LLTV (wad)" value={hasResolvedCurrentMarketConfig ? lltv : '—'} monospace />
+                <Stat label="Loan decimals" value={hasResolvedCurrentMarketConfig ? loanTokenDecimals : '—'} />
+                <Stat label="Collateral decimals" value={hasResolvedCurrentMarketConfig ? collateralTokenDecimals : '—'} />
+                <Stat label="ERC-4626 vault" value={hasResolvedCurrentMarketConfig ? vaultAddress : '—'} monospace />
+              </div>
+            </div>
+          </section>
+
+          {/* ── Wallet + Snapshot (left) ── */}
+          <section className="panel" id="snapshot">
+            <div className="panel__heading">
+              <div className="panel__heading-left">
+                <span className="step-num">1</span>
+                <h2>Connect Wallet</h2>
+              </div>
+              <span className="pill">{account ? 'Connected' : 'Disconnected'}</span>
+            </div>
             <label className="field">
-              <span>Builder mode</span>
-              <select value={builderMode} onChange={(event) => setBuilderMode(event.target.value as BuilderMode)}>
-                <option value="redeem">Redeem / close</option>
-                <option value="deposit">Deposit / leverage</option>
+              <span>Injected provider</span>
+              <select value={selectedProviderId} onChange={(event) => setSelectedProviderId(event.target.value)}>
+                {providers.length === 0 ? <option>No injected provider found</option> : null}
+                {providers.map((provider) => (
+                  <option key={provider.id} value={provider.id}>{provider.label}</option>
+                ))}
               </select>
             </label>
+            <div className="actions">
+              <button
+                className="primary-button"
+                onClick={refreshBaseSnapshot}
+                type="button"
+                disabled={!selectedProvider || !account || refreshingSnapshot || !isCurrentChainSupported}
+              >
+                {refreshingSnapshot ? 'Refreshing…' : 'Refresh snapshot'}
+              </button>
+            </div>
+            <div className="wallet-grid">
+              <Stat label="Account" value={account || 'Not connected'} monospace />
+              <Stat label="Chain" value={currentMorphoChain ? `${currentMorphoChain.network} (${chainId})` : `${chainId} (${numberToHex(chainId)})`} monospace />
+              <Stat label="Morpho" value={currentMorphoAddress || 'Unsupported'} monospace />
+              <Stat label="Bundler3" value={baseSnapshot?.bundler3 || '—'} monospace />
+              <Stat label="GeneralAdapter1" value={baseSnapshot?.generalAdapter1 || '—'} monospace />
+              <Stat label="Authorized now" value={baseSnapshot ? (baseSnapshot.isBundlerAuthorized ? 'Yes' : 'No') : '—'} />
+            </div>
+            <div className="note">
+              <p><strong>Trust model.</strong> The only temporary privilege is Morpho authorization for <code>GeneralAdapter1</code>. Keep <strong>Auto revoke</strong> enabled to remove it in the same transaction.</p>
+            </div>
+          </section>
+
+          {/* ── Position Snapshot (right) ── */}
+          <section className="panel">
+            <div className="panel__heading">
+              <div className="panel__heading-left">
+                <span className="step-num">3</span>
+                <h2>Position Snapshot</h2>
+              </div>
+              <span className={`pill ${baseSnapshot ? 'pill--green' : ''}`}>{baseSnapshot ? 'Loaded' : 'Pending'}</span>
+            </div>
+            <div className="wallet-grid">
+              <Stat label="Market ID" value={baseSnapshot?.marketId || marketIdInput || '—'} monospace />
+              <Stat label="Borrow assets" value={baseSnapshot ? `${formatUnits(baseSnapshot.borrowAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}` : '—'} />
+              <Stat label="Borrow shares" value={baseSnapshot ? baseSnapshot.borrowShares.toString() : '—'} monospace />
+              <Stat label="Collateral" value={baseSnapshot ? `${formatUnits(baseSnapshot.collateral, baseSnapshot.collateralTokenDecimals)} ${baseSnapshot.collateralTokenSymbol}` : '—'} />
+              <Stat label="Current LTV" value={baseSnapshot ? formatWadPercent(baseSnapshot.accrualPosition.ltv) : '—'} />
+              <Stat label="Health factor" value={baseSnapshot ? formatFactor(baseSnapshot.accrualPosition.healthFactor) : '—'} />
+              <Stat label="Borrow APY" value={baseSnapshot ? formatPercent(baseSnapshot.market.borrowApy) : '—'} />
+              <Stat label="Supply APY" value={baseSnapshot ? formatPercent(baseSnapshot.market.supplyApy) : '—'} />
+              <Stat label="Utilization" value={baseSnapshot ? formatWadPercent(baseSnapshot.market.utilization) : '—'} />
+              <Stat label="Full repay est." value={baseSnapshot ? `${formatUnits(baseSnapshot.estimatedFullRepayAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}` : '—'} />
+              <Stat label="Max flash loan" value={baseSnapshot ? `${formatUnits(baseSnapshot.maxFlashLoanAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}` : '—'} />
+              <Stat label="Morpho nonce" value={baseSnapshot ? baseSnapshot.morphoNonce.toString() : '—'} monospace />
+              <Stat label="Wallet loan bal." value={baseSnapshot ? `${formatUnits(baseSnapshot.walletLoanTokenBalance, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}` : '—'} />
+              <Stat label="Adapter allowance" value={baseSnapshot ? `${formatUnits(baseSnapshot.walletLoanTokenAllowanceToAdapter, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}` : '—'} />
+              <Stat label="Vault asset" value={vaultSnapshot?.asset || vaultError || '—'} monospace={Boolean(vaultSnapshot?.asset)} />
+            </div>
+            {builderMode === 'redeem' && baseSnapshot && baseSnapshot.borrowShares === 0n && baseSnapshot.collateral === 0n ? (
+              <div className="warning">The connected account has no position on this market.</div>
+            ) : null}
+            {snapshotError ? <div className="warning">{snapshotError}</div> : null}
+            {vaultError ? <div className="warning">{vaultError}</div> : null}
+          </section>
+
+          {/* ── Plan ── */}
+          <section className="panel panel--wide" id="plan">
+            <div className="panel__heading">
+              <div className="panel__heading-left">
+                <span className="step-num">4</span>
+                <h2>Build Plan</h2>
+              </div>
+              <span className="pill">
+                {builderMode === 'redeem' ? 'Flash-loan exit' : 'Leveraged deposit'}
+              </span>
+            </div>
+
+            {/* Mode toggle */}
+            <div className="mode-tabs">
+              <button
+                className={`mode-tab ${builderMode === 'redeem' ? 'mode-tab--active' : ''}`}
+                onClick={() => setBuilderMode('redeem')}
+                type="button"
+              >
+                Redeem / Exit
+              </button>
+              <button
+                className={`mode-tab ${builderMode === 'deposit' ? 'mode-tab--active' : ''}`}
+                onClick={() => setBuilderMode('deposit')}
+                type="button"
+              >
+                Deposit / Leverage
+              </button>
+            </div>
+
             {builderMode === 'redeem' ? (
-              <>
-                <TextField label="Flash assets" value={flashAssets} onChange={setFlashAssets} />
-                <TextField label="Flash buffer (bps)" value={flashBufferBps} onChange={setFlashBufferBps} />
-                <label className="field">
-                  <span>Repay mode</span>
-                  <select value={repayMode} onChange={(event) => setRepayMode(event.target.value as RepayMode)}>
-                    <option value="full-shares">Full borrow shares</option>
-                    <option value="exact-assets">Exact loan assets</option>
-                  </select>
-                </label>
+              /* ── REDEEM MODE ── */
+              <div className="two-col">
+                {/* Constraint inputs */}
+                <TextField label="Max LTV after (%)" value={redeemMaxLtvAfter} onChange={setRedeemMaxLtvAfter} />
+                <TextField label="Min health after (x)" value={redeemMinHealthAfter} onChange={setRedeemMinHealthAfter} />
 
-                <TextField
-                  label="Repay assets"
-                  value={repayAssets}
-                  onChange={setRepayAssets}
-                  disabled={repayMode !== 'exact-assets'}
-                />
+                {/* Exit slider */}
+                <div className="field field--span-2">
+                  <span>Exit fraction</span>
+                  <div className="exit-slider">
+                    <div className="exit-slider__header">
+                      <div>
+                        <div className="exit-slider__label">Position exit</div>
+                        <div className="exit-slider__value">
+                          {activeRedeemAutoPoint
+                            ? `${((Number(activeRedeemAutoPoint.fractionWad) / 1e18) * 100).toFixed(0)}%`
+                            : redeemAutoLoading ? '…' : 'N/A'}
+                        </div>
+                      </div>
+                      <span className="pill pill--soft">
+                        {redeemAutoLoading
+                          ? 'Computing path'
+                          : redeemAutoPoints.length > 0
+                            ? `${redeemAutoPoints.length} steps`
+                            : 'Unavailable'}
+                      </span>
+                    </div>
 
-                <label className="field field--toggle">
-                  <span>Withdraw all collateral</span>
-                  <input
-                    checked={withdrawAllCollateral}
-                    onChange={(event) => setWithdrawAllCollateral(event.target.checked)}
-                    type="checkbox"
-                  />
-                </label>
+                    <div className="exit-slider__range-wrap">
+                      <div className="exit-slider__track">
+                        <div className="exit-slider__track-fill" style={{ width: `${redeemAutoProgress}%` }} />
+                      </div>
+                      <input
+                        className="exit-slider__range"
+                        type="range"
+                        min={0}
+                        max={Math.max(redeemAutoPoints.length - 1, 0)}
+                        step={1}
+                        value={clampNumber(redeemAutoIndex, 0, Math.max(redeemAutoPoints.length - 1, 0))}
+                        onChange={(event) => setRedeemAutoIndex(Number(event.target.value))}
+                        disabled={redeemAutoLoading || redeemAutoPoints.length <= 1}
+                      />
+                    </div>
 
-                <TextField
-                  label="Withdraw collateral assets"
-                  value={withdrawCollateralAssets}
-                  onChange={setWithdrawCollateralAssets}
-                  disabled={withdrawAllCollateral}
-                />
+                    <div className="exit-slider__legend">
+                      <span>Hold (0% exit)</span>
+                      <span>Full exit (100%)</span>
+                    </div>
+
+                    <div className="exit-slider__stats">
+                      <Stat
+                        label="Repay"
+                        value={activeRedeemAutoPoint && baseSnapshot
+                          ? `${formatUnits(activeRedeemAutoPoint.repayAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                          : '—'}
+                      />
+                      <Stat
+                        label="Withdraw collateral"
+                        value={activeRedeemAutoPoint && baseSnapshot
+                          ? `${formatUnits(activeRedeemAutoPoint.withdrawCollateral, baseSnapshot.collateralTokenDecimals)} ${baseSnapshot.collateralTokenSymbol}`
+                          : '—'}
+                      />
+                      <Stat
+                        label="Health after"
+                        value={activeRedeemAutoPoint
+                          ? (activeRedeemAutoPoint.healthAfter != null ? formatFactor(activeRedeemAutoPoint.healthAfter) : 'Full exit')
+                          : '—'}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Quick exit buttons */}
+                <div className="field field--span-2">
+                  <span>Quick exit</span>
+                  <div className="actions">
+                    <button className="ghost-button" onClick={() => setRedeemAutoIndex(0)} type="button" disabled={redeemAutoLoading || redeemAutoPoints.length === 0}>Hold</button>
+                    <button className="ghost-button" onClick={() => setRedeemAutoIndex(Math.floor(redeemAutoPoints.length * 0.25))} type="button" disabled={redeemAutoLoading || redeemAutoPoints.length < 4}>25%</button>
+                    <button className="ghost-button" onClick={() => setRedeemAutoIndex(Math.floor(redeemAutoPoints.length * 0.5))} type="button" disabled={redeemAutoLoading || redeemAutoPoints.length < 2}>50%</button>
+                    <button className="ghost-button" onClick={() => setRedeemAutoIndex(Math.floor(redeemAutoPoints.length * 0.75))} type="button" disabled={redeemAutoLoading || redeemAutoPoints.length < 4}>75%</button>
+                    <button className="ghost-button" onClick={() => setRedeemAutoIndex(redeemAutoPoints.length - 1)} type="button" disabled={redeemAutoLoading || redeemAutoPoints.length === 0}>Full exit</button>
+                    <button className="ghost-button" onClick={applyMaxSafeWithdraw} type="button" disabled={!redeemPreview?.maxSafeWithdrawAfterRepay}>Max safe withdraw</button>
+                  </div>
+                </div>
 
                 <TextField label="Redeem slippage (bps)" value={redeemSlippageBps} onChange={setRedeemSlippageBps} />
-              </>
+                <TextField label="Flash buffer (bps)" value={flashBufferBps} onChange={setFlashBufferBps} />
+                <TextField label="Auth deadline (min)" value={authorizationDeadlineMinutes} onChange={setAuthorizationDeadlineMinutes} />
+                <label className="field--toggle">
+                  <span>Auto revoke Morpho authorization</span>
+                  <label className="toggle">
+                    <input checked={autoRevoke} onChange={(event) => setAutoRevoke(event.target.checked)} type="checkbox" />
+                    <span className="toggle__track"><span className="toggle__thumb" /></span>
+                  </label>
+                </label>
+
+                {redeemAutoError ? <div className="warning field--span-2">{redeemAutoError}</div> : null}
+
+                <div className="note field--span-2">
+                  <p><strong>Callback sequence.</strong> Authorize <code>GeneralAdapter1</code>, flash-loan loan token, repay Morpho debt, withdraw collateral, redeem ERC-4626 vault shares into loan token, sweep leftover, optionally revoke authorization.</p>
+                  <p><strong>Slider.</strong> Drag from 0 % (hold position) to 100 % (full exit). At each step the app auto-sizes flash assets with your buffer and finds the maximum safe collateral withdrawal. Set <em>Max LTV after</em> or <em>Min health after</em> to cap how much collateral is withdrawn per step.</p>
+                  <p><strong>Loop mode.</strong> When flash liquidity is below the full debt, the builder automatically caps flash assets and adds multi-leg loop iterations in a single callback.</p>
+                </div>
+              </div>
             ) : (
-              <>
+              /* ── DEPOSIT MODE ── */
+              <div className="two-col">
                 <TextField label="Wallet assets in" value={walletAssets} onChange={setWalletAssets} />
                 <TextField label="Deposit slippage (bps)" value={depositSlippageBps} onChange={setDepositSlippageBps} />
                 <TextField label="Max LTV after (%)" value={maxLtvAfter} onChange={setMaxLtvAfter} />
                 <TextField label="Min health after (x)" value={minHealthAfter} onChange={setMinHealthAfter} />
-                <TextField
-                  label="Target utilization after (%)"
-                  value={targetUtilizationAfter}
-                  onChange={applyTargetUtilizationAfter}
-                />
+                <TextField label="Target utilization after (%)" value={targetUtilizationAfter} onChange={applyTargetUtilizationAfter} />
+
                 <div className="field field--span-2">
                   <span>Utilization after</span>
-                  <div className="utilization-slider">
-                    <div className="utilization-slider__header">
+                  <div className="leverage-slider">
+                    <div className="leverage-slider__header">
                       <div>
-                        <div className="utilization-slider__label">Auto leverage</div>
-                        <div className="utilization-slider__value">
+                        <div className="leverage-slider__label">Auto leverage</div>
+                        <div className="leverage-slider__value">
                           {activeDepositAutoLeveragePoint
                             ? formatWadPercent(activeDepositAutoLeveragePoint.utilizationAfter)
                             : 'Not ready'}
@@ -2185,617 +2363,179 @@ export function BundlerApp() {
                       </span>
                     </div>
 
-                    <div className="utilization-slider__range-wrap">
-                      <div className="utilization-slider__track">
-                        <div
-                          className="utilization-slider__track-fill"
-                          style={{ width: `${depositAutoLeverageProgress}%` }}
-                        />
+                    <div className="leverage-slider__range-wrap">
+                      <div className="leverage-slider__track">
+                        <div className="leverage-slider__track-fill" style={{ width: `${depositAutoLeverageProgress}%` }} />
                       </div>
                       <input
-                        className="utilization-slider__range"
+                        className="leverage-slider__range"
                         type="range"
                         min={0}
                         max={Math.max(depositAutoLeveragePoints.length - 1, 0)}
                         step={1}
-                        value={Math.min(
-                          clampNumber(depositAutoLeverageIndex, 0, depositAutoLeveragePoints.length - 1),
-                          Math.max(depositAutoLeveragePoints.length - 1, 0),
-                        )}
+                        value={clampNumber(depositAutoLeverageIndex, 0, Math.max(depositAutoLeveragePoints.length - 1, 0))}
                         onChange={(event) => setDepositAutoLeverageIndex(Number(event.target.value))}
                         disabled={depositAutoLeverageLoading || depositAutoLeveragePoints.length <= 1}
                       />
                     </div>
 
-                    <div className="utilization-slider__legend">
+                    <div className="leverage-slider__legend">
                       <span>{`Current ${baseSnapshot ? formatWadPercent(baseSnapshot.market.utilization) : 'N/A'}`}</span>
                       <span>
                         {depositAutoLeverageMaxPoint
-                          ? `Max feasible ${formatWadPercent(depositAutoLeverageMaxPoint.utilizationAfter)}`
-                          : 'Max feasible N/A'}
+                          ? `Max ${formatWadPercent(depositAutoLeverageMaxPoint.utilizationAfter)}`
+                          : 'Max N/A'}
                       </span>
                     </div>
 
-                    <div className="utilization-slider__stats">
+                    <div className="leverage-slider__stats">
                       <Stat
                         label="Flash assets"
-                        value={
-                          activeDepositAutoLeveragePoint && baseSnapshot
-                            ? `${formatUnits(activeDepositAutoLeveragePoint.flashAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`.trim()
-                            : 'Not ready'
-                        }
+                        value={activeDepositAutoLeveragePoint && baseSnapshot
+                          ? `${formatUnits(activeDepositAutoLeveragePoint.flashAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                          : '—'}
                       />
                       <Stat
                         label="Target borrow after"
-                        value={
-                          activeDepositAutoLeveragePoint && baseSnapshot
-                            ? `${formatUnits(activeDepositAutoLeveragePoint.targetBorrowAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`.trim()
-                            : 'Not ready'
-                        }
+                        value={activeDepositAutoLeveragePoint && baseSnapshot
+                          ? `${formatUnits(activeDepositAutoLeveragePoint.targetBorrowAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                          : '—'}
                       />
                       <Stat
                         label="Vault deposit"
-                        value={
-                          activeDepositAutoLeveragePoint && baseSnapshot
-                            ? `${formatUnits(activeDepositAutoLeveragePoint.totalDepositAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`.trim()
-                            : 'Not ready'
-                        }
+                        value={activeDepositAutoLeveragePoint && baseSnapshot
+                          ? `${formatUnits(activeDepositAutoLeveragePoint.totalDepositAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                          : '—'}
                       />
                     </div>
                   </div>
                 </div>
-              </>
-            )}
 
-            <TextField
-              label="Auth deadline (minutes)"
-              value={authorizationDeadlineMinutes}
-              onChange={setAuthorizationDeadlineMinutes}
-            />
+                <div className="actions field--span-2">
+                  <button className="ghost-button" onClick={() => setDepositAutoLeverageIndex(0)} type="button" disabled={depositAutoLeverageLoading || depositAutoLeveragePoints.length === 0}>Current point</button>
+                  <button className="ghost-button" onClick={() => setDepositAutoLeverageIndex(Math.max(depositAutoLeveragePoints.length - 1, 0))} type="button" disabled={depositAutoLeverageLoading || depositAutoLeveragePoints.length <= 1}>Max leverage</button>
+                  <button className="ghost-button" onClick={applyWalletBalance} type="button" disabled={!baseSnapshot}>Use wallet balance</button>
+                  <button className="ghost-button" onClick={approveLoanToken} type="button" disabled={!baseSnapshot || !walletAssets.trim() || walletAssets.trim() === '0'}>Approve exact amount</button>
+                </div>
 
-            <label className="field field--toggle">
-              <span>Auto revoke Morpho authorization</span>
-              <input checked={autoRevoke} onChange={(event) => setAutoRevoke(event.target.checked)} type="checkbox" />
-            </label>
-          </div>
+                <TextField label="Auth deadline (min)" value={authorizationDeadlineMinutes} onChange={setAuthorizationDeadlineMinutes} />
+                <label className="field--toggle">
+                  <span>Auto revoke Morpho authorization</span>
+                  <label className="toggle">
+                    <input checked={autoRevoke} onChange={(event) => setAutoRevoke(event.target.checked)} type="checkbox" />
+                    <span className="toggle__track"><span className="toggle__thumb" /></span>
+                  </label>
+                </label>
 
-          <div className="actions">
-            {builderMode === 'redeem' ? (
-              <>
-                <button className="ghost-button" onClick={applyMaxFlashLoan} type="button" disabled={!baseSnapshot}>
-                  Use max flash loan
-                </button>
-                <button
-                  className="ghost-button"
-                  onClick={() => applyRepayFraction(1n, 4n)}
-                  type="button"
-                  disabled={!baseSnapshot || baseSnapshot.borrowAssets === 0n}
-                >
-                  Repay 25%
-                </button>
-                <button
-                  className="ghost-button"
-                  onClick={() => applyRepayFraction(1n, 2n)}
-                  type="button"
-                  disabled={!baseSnapshot || baseSnapshot.borrowAssets === 0n}
-                >
-                  Repay 50%
-                </button>
-                <button
-                  className="ghost-button"
-                  onClick={() => applyRepayFraction(3n, 4n)}
-                  type="button"
-                  disabled={!baseSnapshot || baseSnapshot.borrowAssets === 0n}
-                >
-                  Repay 75%
-                </button>
-                <button
-                  className="ghost-button"
-                  onClick={() => applyRepayFraction(1n, 1n)}
-                  type="button"
-                  disabled={!baseSnapshot || baseSnapshot.borrowAssets === 0n}
-                >
-                  Repay 100%
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  className="ghost-button"
-                  onClick={() => setDepositAutoLeverageIndex(0)}
-                  type="button"
-                  disabled={depositAutoLeverageLoading || depositAutoLeveragePoints.length === 0}
-                >
-                  Current point
-                </button>
-                <button
-                  className="ghost-button"
-                  onClick={() => setDepositAutoLeverageIndex(Math.max(depositAutoLeveragePoints.length - 1, 0))}
-                  type="button"
-                  disabled={depositAutoLeverageLoading || depositAutoLeveragePoints.length <= 1}
-                >
-                  Max leverage
-                </button>
-                <button className="ghost-button" onClick={applyWalletBalance} type="button" disabled={!baseSnapshot}>
-                  Use wallet balance
-                </button>
-                <button
-                  className="ghost-button"
-                  onClick={approveLoanToken}
-                  type="button"
-                  disabled={!baseSnapshot || !walletAssets.trim() || walletAssets.trim() === '0'}
-                >
-                  Approve exact amount
-                </button>
-              </>
-            )}
-          </div>
+                {depositAutoLeverageError ? <div className="warning field--span-2">{depositAutoLeverageError}</div> : null}
 
-          {builderMode === 'redeem' ? (
-            <div className="actions">
-              <button
-                className="ghost-button"
-                onClick={() => applyWithdrawFraction(1n, 4n)}
-                type="button"
-                disabled={!baseSnapshot || baseSnapshot.collateral === 0n}
-              >
-                Withdraw 25%
-              </button>
-              <button
-                className="ghost-button"
-                onClick={() => applyWithdrawFraction(1n, 2n)}
-                type="button"
-                disabled={!baseSnapshot || baseSnapshot.collateral === 0n}
-              >
-                Withdraw 50%
-              </button>
-              <button
-                className="ghost-button"
-                onClick={() => applyWithdrawFraction(3n, 4n)}
-                type="button"
-                disabled={!baseSnapshot || baseSnapshot.collateral === 0n}
-              >
-                Withdraw 75%
-              </button>
-              <button
-                className="ghost-button"
-                onClick={() => applyWithdrawFraction(1n, 1n)}
-                type="button"
-                disabled={!baseSnapshot || baseSnapshot.collateral === 0n}
-              >
-                Withdraw 100%
-              </button>
-              <button
-                className="ghost-button"
-                onClick={applyMaxSafeWithdraw}
-                type="button"
-                disabled={!redeemPreview?.maxSafeWithdrawAfterRepay}
-              >
-                Max safe withdraw
-              </button>
-            </div>
-          ) : null}
-
-          <div className="note">
-            {builderMode === 'redeem' ? (
-              <>
-                <p>
-                  <strong>Callback sequence.</strong> authorize <code>GeneralAdapter1</code>, flash-loan loan token,
-                  repay Morpho debt, withdraw collateral, redeem the ERC-4626 collateral into loan token, sweep leftover
-                  loan token through the official Morpho Bundler flow, then optionally revoke authorization.
-                </p>
-                <p>
-                  <strong>Loop mode.</strong> When the market&apos;s flash-loan liquidity is below the full debt, the
-                  builder automatically caps <code>Flash assets</code> to Morpho&apos;s available balance and rolls
-                  multiple repay-withdraw-redeem legs inside the same callback.
-                </p>
-              </>
-            ) : (
-              <>
-                <p>
-                  <strong>Callback sequence.</strong> optionally pull loan tokens from the connected wallet, optionally
-                  flash-loan more loan tokens, deposit wallet + flash into the ERC-4626 vault, supply the minted vault
-                  shares as Morpho collateral, then borrow against that collateral through the official Morpho Bundler
-                  flow, sweep any remaining loan token back to the wallet, and optionally revoke authorization.
-                </p>
-                <p>
-                  <strong>Leverage semantics.</strong> There is exactly one borrow leg
-                  after the initial vault deposit. Borrow equal to <code>Flash assets</code> only repays the flash
-                  principal; any additional borrow is swept back to the wallet instead of being redeposited.
-                  The borrow leg can only use Morpho&apos;s remaining loan-token liquidity after the flash is already
-                  outstanding, so the maximum feasible leverage flash is usually below Morpho&apos;s raw flash-loan cap.
-                </p>
-                <p>
-                  <strong>Allowance model.</strong> Deposit mode needs an ERC20 approval on the loan token for
-                  <code> GeneralAdapter1 </code> when <code>Wallet assets in</code> is non-zero. The button above sends
-                  an exact-amount approval.
-                </p>
-                <p>
-                  <strong>Slider model.</strong> The <code>Utilization after</code> slider keeps
-                  <code> Wallet assets in </code> fixed, then automatically grows flash + borrow along the current
-                  feasible leverage path until Morpho, LLTV, or your Max LTV / Min health constraints stop it. You can
-                  drag the slider or type a target utilization directly.
-                </p>
-              </>
-            )}
-            <p>
-              <strong>Vault requirement.</strong> The ERC-4626 vault asset must be the same token as the Morpho loan
-              token. The discovered market list only keeps markets where this holds on-chain.
-            </p>
-          </div>
-
-          {builderMode === 'deposit' && depositAutoLeverageError ? (
-            <div className="warning">{depositAutoLeverageError}</div>
-          ) : null}
-        </section>
-
-        <section className="panel">
-          <div className="panel__heading">
-            <h2>Expected effect</h2>
-            <span className="pill pill--soft">Local simulation</span>
-          </div>
-
-          {builderMode === 'deposit' ? (
-            <>
-              <div className="wallet-grid">
-                <Stat
-                  label="Wallet assets in"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.walletAssetsIn, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Flash used"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.flashAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Target borrow after"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.targetBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Vault deposit"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.totalDepositAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Preview deposit shares"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.previewDepositShares, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Added borrow"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.additionalBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Final borrow leg"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.finalBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Liquid out after flash"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.netLoanTokenOut, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Max safe after initial"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.maxSafeBorrowAfterInitialDeposit, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Callback liquidity after flash"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.callbackBorrowLiquidityAfterFlash, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Max target after constraints"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.maxTargetBorrowAssetsAfterConstraints, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Borrow after"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.finalPosition.borrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Collateral after"
-                  value={
-                    depositPreview
-                      ? `${formatUnits(depositPreview.finalPosition.collateral, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="LTV after"
-                  value={depositPreview ? formatWadPercent(depositPreview.finalPosition.ltv) : 'Not ready'}
-                />
-                <Stat
-                  label="Health after"
-                  value={depositPreview ? formatFactor(depositPreview.finalPosition.healthFactor) : 'Not ready'}
-                />
-                <Stat
-                  label="Borrow APY after"
-                  value={depositPreview ? formatPercent(depositPreview.finalPosition.market.borrowApy) : 'Not ready'}
-                />
-                <Stat
-                  label="Supply APY after"
-                  value={depositPreview ? formatPercent(depositPreview.finalPosition.market.supplyApy) : 'Not ready'}
-                />
-                <Stat
-                  label="Utilization after"
-                  value={depositPreview ? formatWadPercent(depositPreview.finalPosition.market.utilization) : 'Not ready'}
-                />
+                <div className="note field--span-2">
+                  <p><strong>Callback sequence.</strong> Optionally pull loan tokens from wallet, flash-loan, deposit into ERC-4626 vault, supply vault shares as Morpho collateral, borrow against collateral, sweep remainder back to wallet, optionally revoke authorization.</p>
+                  <p><strong>Slider.</strong> Keeps <em>Wallet assets in</em> fixed and grows flash + borrow along the feasible leverage path. Drag or type a target utilization. Max LTV after / Min health after constraints limit the upper end of the slider.</p>
+                  <p><strong>Allowance.</strong> Deposit mode needs an ERC20 approval on the loan token for <code>GeneralAdapter1</code> when <em>Wallet assets in</em> &gt; 0.</p>
+                </div>
               </div>
-              {depositPreview?.message ? <div className="warning">{depositPreview.message}</div> : null}
-            </>
-          ) : (
-            <div className="wallet-grid">
-              <Stat
-                label="Repay used"
-                value={
-                  redeemPreview
-                    ? `${formatUnits(redeemPreview.repayAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                    : 'Not ready'
-                }
-              />
-              <Stat
-                label="Requested withdraw"
-                value={
-                  redeemPreview
-                    ? `${formatUnits(redeemPreview.requestedWithdrawCollateral, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim()
-                    : 'Not ready'
-                }
-              />
-              <Stat
-                label="Max safe withdraw"
-                value={
-                  redeemPreview?.maxSafeWithdrawAfterRepay != null
-                    ? `${formatUnits(redeemPreview.maxSafeWithdrawAfterRepay, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim()
-                    : 'Not ready'
-                }
-              />
-              <Stat
-                label="Loop legs"
-                value={redeemPreview?.usedLoop ? String(redeemPreview.loopIterations ?? 0) : '1'}
-              />
-              <Stat
-                label="Borrow after"
-                value={
-                  redeemPreview?.afterWithdrawPosition
-                    ? `${formatUnits(redeemPreview.afterWithdrawPosition.borrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                    : redeemPreview
-                      ? `${formatUnits(redeemPreview.afterRepayPosition.borrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                }
-              />
-              <Stat
-                label="Collateral after"
-                value={
-                  redeemPreview?.afterWithdrawPosition
-                    ? `${formatUnits(redeemPreview.afterWithdrawPosition.collateral, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim()
-                    : redeemPreview
-                      ? `${formatUnits(redeemPreview.afterRepayPosition.collateral, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                }
-              />
-              <Stat
-                label="LTV after"
-                value={
-                  redeemPreview?.afterWithdrawPosition
-                    ? formatWadPercent(redeemPreview.afterWithdrawPosition.ltv)
-                    : redeemPreview
-                      ? formatWadPercent(redeemPreview.afterRepayPosition.ltv)
-                      : 'Not ready'
-                }
-              />
-              <Stat
-                label="Health after"
-                value={
-                  redeemPreview?.afterWithdrawPosition
-                    ? formatFactor(redeemPreview.afterWithdrawPosition.healthFactor)
-                    : redeemPreview
-                      ? formatFactor(redeemPreview.afterRepayPosition.healthFactor)
-                      : 'Not ready'
-                }
-              />
-              <Stat
-                label="Borrow APY after"
-                value={
-                  redeemPreview
-                    ? formatPercent(redeemPreview.afterRepayPosition.market.borrowApy)
-                    : 'Not ready'
-                }
-              />
-              <Stat
-                label="Supply APY after"
-                value={
-                  redeemPreview
-                    ? formatPercent(redeemPreview.afterRepayPosition.market.supplyApy)
-                    : 'Not ready'
-                }
-              />
-              <Stat
-                label="Utilization after"
-                value={
-                  redeemPreview
-                    ? formatWadPercent(redeemPreview.afterRepayPosition.market.utilization)
-                    : 'Not ready'
-                }
-              />
-            </div>
-          )}
-
-          {redeemPreview?.withdrawError ? (
-            <div className="warning">{redeemPreview.withdrawError}</div>
-          ) : null}
-        </section>
-
-        <section className="panel">
-          <div className="panel__heading">
-            <h2>Preview</h2>
-            <span className="pill pill--soft">Dry build</span>
-          </div>
-
-          <div className="wallet-grid">
-            {builderMode === 'deposit' ? (
-              <>
-                <Stat
-                  label="Vault deposit"
-                  value={
-                    previewAmount != null
-                      ? `${formatUnits(previewAmount, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Preview deposit shares"
-                  value={
-                    previewShares != null
-                      ? `${formatUnits(previewShares, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Target borrow after"
-                  value={
-                    draft.targetBorrowAssets != null
-                      ? `${formatUnits(draft.targetBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Estimated added borrow"
-                  value={
-                    previewExpectedBorrowAssets != null
-                      ? `${formatUnits(previewExpectedBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Liquid out after flash"
-                  value={
-                    previewEstimatedNetAssets != null
-                      ? `${formatUnits(previewEstimatedNetAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-              </>
-            ) : (
-              <>
-                <Stat
-                  label="Withdraw shares"
-                  value={
-                    previewShares != null
-                      ? `${formatUnits(previewShares, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Preview redeem"
-                  value={
-                    previewAmount != null
-                      ? `${formatUnits(previewAmount, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Estimated repay"
-                  value={
-                    previewExpectedRepayAssets != null
-                      ? `${formatUnits(previewExpectedRepayAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-                <Stat
-                  label="Estimated net out"
-                  value={
-                    previewEstimatedNetAssets != null
-                      ? `${formatUnits(previewEstimatedNetAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim()
-                      : 'Not ready'
-                  }
-                />
-              </>
             )}
-          </div>
+          </section>
 
-          {draft.error ? <div className="warning">{draft.error}</div> : null}
-          {draft.warnings.map((warning: string) => (
-            <div className="warning" key={warning}>
-              {warning}
+          {/* ── Expected Effect ── */}
+          <section className="panel" id="effect">
+            <div className="panel__heading">
+              <h2>Expected Effect</h2>
+              <span className="pill pill--soft">Local simulation</span>
             </div>
-          ))}
 
-          <div className="actions">
-            <button
-              className="primary-button"
-              onClick={sendBundle}
-              type="button"
-              disabled={!selectedProvider || !account || Boolean(draft.error) || sendingBundle}
-            >
-              {sendingBundle ? 'Signing + sending…' : `Sign and send ${builderMode === 'redeem' ? 'redeem' : 'deposit'} tx`}
-            </button>
-          </div>
-        </section>
+            {builderMode === 'deposit' ? (
+              <div className="wallet-grid">
+                <Stat label="Wallet assets in" value={depositPreview ? `${formatUnits(depositPreview.walletAssetsIn, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Flash used" value={depositPreview ? `${formatUnits(depositPreview.flashAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Target borrow after" value={depositPreview ? `${formatUnits(depositPreview.targetBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Vault deposit" value={depositPreview ? `${formatUnits(depositPreview.totalDepositAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Preview deposit shares" value={depositPreview ? `${formatUnits(depositPreview.previewDepositShares, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Added borrow" value={depositPreview ? `${formatUnits(depositPreview.additionalBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Final borrow" value={depositPreview ? `${formatUnits(depositPreview.finalBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Liquid out after flash" value={depositPreview ? `${formatUnits(depositPreview.netLoanTokenOut, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Borrow after" value={depositPreview ? `${formatUnits(depositPreview.finalPosition.borrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Collateral after" value={depositPreview ? `${formatUnits(depositPreview.finalPosition.collateral, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="LTV after" value={depositPreview ? formatWadPercent(depositPreview.finalPosition.ltv) : '—'} />
+                <Stat label="Health after" value={depositPreview ? formatFactor(depositPreview.finalPosition.healthFactor) : '—'} />
+                <Stat label="Borrow APY after" value={depositPreview ? formatPercent(depositPreview.finalPosition.market.borrowApy) : '—'} />
+                <Stat label="Utilization after" value={depositPreview ? formatWadPercent(depositPreview.finalPosition.market.utilization) : '—'} />
+              </div>
+            ) : (
+              <div className="wallet-grid">
+                <Stat label="Repay used" value={redeemPreview ? `${formatUnits(redeemPreview.repayAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Requested withdraw" value={redeemPreview ? `${formatUnits(redeemPreview.requestedWithdrawCollateral, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Max safe withdraw" value={redeemPreview?.maxSafeWithdrawAfterRepay != null ? `${formatUnits(redeemPreview.maxSafeWithdrawAfterRepay, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Loop legs" value={redeemPreview?.usedLoop ? String(redeemPreview.loopIterations ?? 0) : '1'} />
+                <Stat label="Borrow after" value={redeemPreview?.afterWithdrawPosition ? `${formatUnits(redeemPreview.afterWithdrawPosition.borrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : redeemPreview ? `${formatUnits(redeemPreview.afterRepayPosition.borrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Collateral after" value={redeemPreview?.afterWithdrawPosition ? `${formatUnits(redeemPreview.afterWithdrawPosition.collateral, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim() : redeemPreview ? `${formatUnits(redeemPreview.afterRepayPosition.collateral, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="LTV after" value={redeemPreview?.afterWithdrawPosition ? formatWadPercent(redeemPreview.afterWithdrawPosition.ltv) : redeemPreview ? formatWadPercent(redeemPreview.afterRepayPosition.ltv) : '—'} />
+                <Stat label="Health after" value={redeemPreview?.afterWithdrawPosition ? formatFactor(redeemPreview.afterWithdrawPosition.healthFactor) : redeemPreview ? formatFactor(redeemPreview.afterRepayPosition.healthFactor) : '—'} />
+                <Stat label="Borrow APY after" value={redeemPreview ? formatPercent(redeemPreview.afterRepayPosition.market.borrowApy) : '—'} />
+                <Stat label="Utilization after" value={redeemPreview ? formatWadPercent(redeemPreview.afterRepayPosition.market.utilization) : '—'} />
+              </div>
+            )}
+            {redeemPreview?.withdrawError ? <div className="warning">{redeemPreview.withdrawError}</div> : null}
+            {depositPreview?.message ? <div className="warning">{depositPreview.message}</div> : null}
+          </section>
 
-        <section className="panel panel--wide">
-          <div className="panel__heading">
-            <h2>Payloads</h2>
-            <span className="pill">Builder output</span>
-          </div>
+          {/* ── Preview & Send ── */}
+          <section className="panel" id="preview">
+            <div className="panel__heading">
+              <div className="panel__heading-left">
+                <span className="step-num">5</span>
+                <h2>Sign &amp; Send</h2>
+              </div>
+              <span className="pill pill--soft">Dry build</span>
+            </div>
 
-          <PayloadBlock
-            label="Unsigned actions"
-            value={actionJson}
-            helper="These are the Bundler3 actions that will be encoded on send. Any null Morpho authorization signatures are requested from the wallet immediately before submission."
-          />
-          <PayloadBlock
-            label="Authorization typed data"
-            value={lastTypedDataJson || typedDataJson}
-            helper="The wallet signs these EIP-712 messages off-chain. With auto-revoke enabled there are two signatures: authorize, then revoke."
-          />
-          <PayloadBlock
-            label="Signed transaction request"
-            value={lastSignedRequestJson}
-            helper="After signatures are collected, this is the single standard Ethereum transaction submitted to Bundler3."
-          />
-        </section>
+            <div className="wallet-grid">
+              {builderMode === 'deposit' ? (
+                <>
+                  <Stat label="Vault deposit" value={previewAmount != null ? `${formatUnits(previewAmount, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                  <Stat label="Preview deposit shares" value={previewShares != null ? `${formatUnits(previewShares, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim() : '—'} />
+                  <Stat label="Target borrow after" value={draft.targetBorrowAssets != null ? `${formatUnits(draft.targetBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                  <Stat label="Estimated added borrow" value={previewExpectedBorrowAssets != null ? `${formatUnits(previewExpectedBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                  <Stat label="Liquid out after flash" value={previewEstimatedNetAssets != null ? `${formatUnits(previewEstimatedNetAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                </>
+              ) : (
+                <>
+                  <Stat label="Withdraw shares" value={previewShares != null ? `${formatUnits(previewShares, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim() : '—'} />
+                  <Stat label="Preview redeem" value={previewAmount != null ? `${formatUnits(previewAmount, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                  <Stat label="Estimated repay" value={previewExpectedRepayAssets != null ? `${formatUnits(previewExpectedRepayAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                  <Stat label="Estimated net out" value={previewEstimatedNetAssets != null ? `${formatUnits(previewEstimatedNetAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                </>
+              )}
+            </div>
+
+            {draft.error ? <div className="warning">{draft.error}</div> : null}
+            {draft.warnings.map((w: string) => <div className="warning" key={w}>{w}</div>)}
+
+            <div className="actions" style={{ marginTop: 16 }}>
+              <button
+                className="primary-button"
+                onClick={sendBundle}
+                type="button"
+                disabled={!selectedProvider || !account || Boolean(draft.error) || sendingBundle}
+              >
+                {sendingBundle ? 'Signing + sending…' : `Sign and send ${builderMode === 'redeem' ? 'redeem' : 'deposit'} tx`}
+              </button>
+            </div>
+          </section>
+
+          {/* ── Payloads ── */}
+          <section className="panel panel--wide" id="payloads">
+            <div className="panel__heading">
+              <h2>Payloads</h2>
+              <span className="pill">Builder output</span>
+            </div>
+            <PayloadBlock label="Unsigned actions" value={actionJson} helper="Bundler3 actions that will be encoded on send. Null Morpho authorization signatures are requested from the wallet immediately before submission." />
+            <PayloadBlock label="Authorization typed data" value={lastTypedDataJson || typedDataJson} helper="The wallet signs these EIP-712 messages off-chain. With auto-revoke enabled there are two signatures: authorize then revoke." />
+            <PayloadBlock label="Signed transaction request" value={lastSignedRequestJson} helper="After signatures are collected, this is the single standard Ethereum transaction submitted to Bundler3." />
+          </section>
+
+        </div>
       </main>
     </div>
   )
@@ -3395,6 +3135,160 @@ function applyBpsBuffer(value: bigint, bps: bigint) {
 
 function clampFlashAssets(requested: bigint, maxAvailable: bigint) {
   return requested < maxAvailable ? requested : maxAvailable
+}
+
+const WAD = 1_000_000_000_000_000_000n
+
+function computeRedeemAutoPoints(parameters: {
+  snapshot: BaseSnapshot
+  flashBufferBps: bigint
+  riskConstraints: { maxLtvAfter?: bigint; minHealthAfter?: bigint }
+}): RedeemAutoPoint[] {
+  const { snapshot, flashBufferBps, riskConstraints } = parameters
+  if (snapshot.borrowAssets <= 0n) return []
+
+  const STEPS = 20
+  const seen = new Set<string>()
+  const points: RedeemAutoPoint[] = []
+
+  const addPoint = (point: RedeemAutoPoint) => {
+    const key = `${point.repayAssets}-${point.withdrawCollateral}`
+    if (seen.has(key)) return
+    seen.add(key)
+    points.push(point)
+  }
+
+  for (let step = 0; step <= STEPS; step++) {
+    const fractionWad = (BigInt(step) * WAD) / BigInt(STEPS)
+    const isFullExit = fractionWad >= WAD
+
+    let repayAssets: bigint
+    let repayMode: RepayMode
+
+    if (isFullExit) {
+      repayAssets = snapshot.borrowAssets
+      repayMode = 'full-shares'
+    } else {
+      repayAssets = (snapshot.borrowAssets * fractionWad) / WAD
+      repayMode = 'exact-assets'
+    }
+
+    // Simulate after-repay position
+    let afterRepayPosition: AccrualPosition
+    try {
+      if (isFullExit) {
+        afterRepayPosition = snapshot.accrualPosition.repay(0n, snapshot.borrowShares).position
+      } else if (repayAssets > 0n) {
+        afterRepayPosition = snapshot.accrualPosition.repay(repayAssets, 0n).position
+      } else {
+        afterRepayPosition = snapshot.accrualPosition
+      }
+    } catch {
+      continue
+    }
+
+    // Compute max safe withdraw
+    const rawMax = afterRepayPosition.withdrawableCollateral ?? 0n
+    const maxWithdraw = rawMax < snapshot.collateral ? rawMax : snapshot.collateral
+
+    let withdrawCollateral: bigint
+    if (isFullExit) {
+      withdrawCollateral = snapshot.collateral
+    } else if (!hasDepositRiskConstraints(riskConstraints)) {
+      withdrawCollateral = maxWithdraw
+    } else {
+      withdrawCollateral = findMaxWithdrawForConstraints({
+        afterRepayPosition,
+        maxWithdraw,
+        riskConstraints,
+      })
+    }
+
+    if (withdrawCollateral < 0n) withdrawCollateral = 0n
+
+    // Verify constraints are satisfied for non-full-exit
+    if (!isFullExit && hasDepositRiskConstraints(riskConstraints)) {
+      try {
+        const testPos = withdrawCollateral > 0n
+          ? afterRepayPosition.withdrawCollateral(withdrawCollateral)
+          : afterRepayPosition
+        if (!satisfiesDepositRiskConstraints(testPos, riskConstraints)) continue
+      } catch {
+        continue
+      }
+    }
+
+    // Compute position metrics after withdraw
+    let ltvAfter: bigint | null = null
+    let healthAfter: bigint | null = null
+    try {
+      if (isFullExit) {
+        ltvAfter = 0n
+        healthAfter = null
+      } else if (withdrawCollateral > 0n) {
+        const afterWithdraw = afterRepayPosition.withdrawCollateral(withdrawCollateral)
+        ltvAfter = afterWithdraw.ltv ?? null
+        healthAfter = afterWithdraw.healthFactor ?? null
+      } else {
+        ltvAfter = afterRepayPosition.ltv ?? null
+        healthAfter = afterRepayPosition.healthFactor ?? null
+      }
+    } catch {
+      ltvAfter = null
+      healthAfter = null
+    }
+
+    const flashAssets = clampFlashAssets(
+      applyBpsBuffer(repayAssets, flashBufferBps),
+      snapshot.maxFlashLoanAssets,
+    )
+
+    addPoint({ fractionWad, repayMode, repayAssets, withdrawCollateral, flashAssets, ltvAfter, healthAfter })
+  }
+
+  return points
+}
+
+function findMaxWithdrawForConstraints(parameters: {
+  afterRepayPosition: AccrualPosition
+  maxWithdraw: bigint
+  riskConstraints: { maxLtvAfter?: bigint; minHealthAfter?: bigint }
+}): bigint {
+  const { afterRepayPosition, maxWithdraw, riskConstraints } = parameters
+
+  if (!hasDepositRiskConstraints(riskConstraints)) return maxWithdraw
+  if (maxWithdraw <= 0n) return 0n
+
+  // 0 withdrawal check
+  if (!satisfiesDepositRiskConstraints(afterRepayPosition, riskConstraints)) return 0n
+
+  // Max withdrawal check
+  try {
+    const atMax = afterRepayPosition.withdrawCollateral(maxWithdraw)
+    if (satisfiesDepositRiskConstraints(atMax, riskConstraints)) return maxWithdraw
+  } catch { /* fall through to binary search */ }
+
+  // Binary search
+  let low = 0n
+  let high = maxWithdraw
+  let best = 0n
+
+  for (let i = 0; i < 24 && low < high; i++) {
+    const mid = low + (high - low + 1n) / 2n
+    try {
+      const pos = afterRepayPosition.withdrawCollateral(mid)
+      if (satisfiesDepositRiskConstraints(pos, riskConstraints)) {
+        best = mid
+        low = mid
+      } else {
+        high = mid - 1n
+      }
+    } catch {
+      high = mid - 1n
+    }
+  }
+
+  return best
 }
 
 function assertAddress(value: string): Address {
