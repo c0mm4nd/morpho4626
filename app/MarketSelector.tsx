@@ -5,10 +5,9 @@ type MarketSelectorProps = {
   selectedMarketId: string
   chainLabel: string
   helperText: string
+  hasLoadedMarkets: boolean
   discovering: boolean
   discoveredMarketsError: string
-  resolvingMarketConfig: boolean
-  marketConfigError: string
   refreshDisabled: boolean
   onRefresh: () => void
   onSelectMarket: (market: DiscoveredVaultMarket) => void
@@ -35,39 +34,45 @@ export function MarketSelector(props: MarketSelectorProps) {
           <p>{props.helperText}</p>
         </div>
         <button className="ghost-button" onClick={props.onRefresh} type="button" disabled={props.refreshDisabled}>
-          {props.discovering ? 'Discovering...' : 'Refresh markets'}
+          {props.discovering ? 'Discovering...' : props.hasLoadedMarkets ? 'Refresh markets' : 'Discover markets'}
         </button>
       </div>
 
       <div className="market-selector__summary">
         <span className="pill">{props.chainLabel}</span>
-        <span className="pill">{`${directRedeemMarkets.length} direct redeem`}</span>
-        <span className="pill">{`${depositOnlyMarkets.length} deposit only`}</span>
+        {props.hasLoadedMarkets ? <span className="pill">{`${directRedeemMarkets.length} direct redeem`}</span> : null}
+        {props.hasLoadedMarkets ? <span className="pill">{`${depositOnlyMarkets.length} deposit only`}</span> : null}
       </div>
 
       {props.discovering ? <div className="warning">Discovering ERC-4626 markets on the current chain...</div> : null}
       {props.discoveredMarketsError ? <div className="warning">{props.discoveredMarketsError}</div> : null}
-      {props.resolvingMarketConfig ? <div className="warning">Resolving market parameters from Market ID...</div> : null}
-      {props.marketConfigError ? <div className="warning">{props.marketConfigError}</div> : null}
+      {!props.hasLoadedMarkets && !props.discovering && !props.discoveredMarketsError ? (
+        <div className="market-group__empty">
+          Discovery is optional. Click <strong>Discover markets</strong> to browse ERC-4626 markets on this chain, or
+          paste a Market ID below.
+        </div>
+      ) : null}
 
-      <div className="market-selector__groups">
-        <MarketGroup
-          title="Direct redeem"
-          description="Vault previews both direct deposit and direct redeem back into the loan token."
-          emptyLabel="No directly redeemable ERC-4626 markets were found on this chain."
-          markets={directRedeemMarkets}
-          selectedMarketId={props.selectedMarketId}
-          onSelectMarket={props.onSelectMarket}
-        />
-        <MarketGroup
-          title="Deposit only"
-          description="Vault previews direct deposit, but direct redeem is not available from the ERC-4626 probe."
-          emptyLabel="No deposit-only ERC-4626 markets were found on this chain."
-          markets={depositOnlyMarkets}
-          selectedMarketId={props.selectedMarketId}
-          onSelectMarket={props.onSelectMarket}
-        />
-      </div>
+      {props.hasLoadedMarkets ? (
+        <div className="market-selector__groups">
+          <MarketGroup
+            title="Direct redeem"
+            description="Vault previews both direct deposit and direct redeem back into the loan token."
+            emptyLabel="No directly redeemable ERC-4626 markets were found on this chain."
+            markets={directRedeemMarkets}
+            selectedMarketId={props.selectedMarketId}
+            onSelectMarket={props.onSelectMarket}
+          />
+          <MarketGroup
+            title="Deposit only"
+            description="Vault previews direct deposit, but direct redeem is not available from the ERC-4626 probe."
+            emptyLabel="No deposit-only ERC-4626 markets were found on this chain."
+            markets={depositOnlyMarkets}
+            selectedMarketId={props.selectedMarketId}
+            onSelectMarket={props.onSelectMarket}
+          />
+        </div>
+      ) : null}
     </div>
   )
 }
