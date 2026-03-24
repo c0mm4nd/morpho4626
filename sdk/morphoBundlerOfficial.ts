@@ -85,9 +85,11 @@ export type MorphoBundlerDepositParameters = {
   account: Address
   marketParams: MarketParams
   vault: Address
-  morphoLiquidityAssets: bigint
+  flashLoanLiquidityAssets: bigint
+  marketBorrowLiquidityAssets: bigint
   walletAssets: bigint
   flashAssets: bigint
+  targetDepositAssets: bigint
   targetBorrowAssets: bigint
   maxVaultSharePriceE27: bigint
   borrowSlippageBps: bigint
@@ -99,10 +101,25 @@ export type MorphoBundlerDepositParameters = {
   previewDepositShares: bigint
 }
 
+export type MorphoBundlerDepositLoopIteration = {
+  index: number
+  depositAssets: bigint
+  depositShares: bigint
+  borrowAssets: bigint
+  borrowShares: bigint
+  loanTokenBalanceAfter: bigint
+  totalDepositAssetsAfter: bigint
+  totalBorrowAssetsAfter: bigint
+  borrowAssetsAfter: bigint
+  borrowSharesAfter: bigint
+  collateralAfter: bigint
+}
+
 export type MorphoBundlerDepositSummary = {
   walletAssetsIn: bigint
   flashAssets: bigint
   currentBorrowAssets: bigint
+  targetDepositAssets: bigint
   targetBorrowAssets: bigint
   initialDepositAssets: bigint
   totalDepositAssets: bigint
@@ -115,6 +132,9 @@ export type MorphoBundlerDepositSummary = {
   finalBorrowShares: bigint
   netLoanTokenOut: bigint
   finalPosition: AccrualPosition
+  loopEnabled: boolean
+  iterationCount: number
+  iterations: MorphoBundlerDepositLoopIteration[]
   completed: boolean
   message?: string
 }
@@ -497,39 +517,39 @@ function buildDepositExecution(parameters: MorphoBundlerDepositParameters): {
   const callbackActions: Action[] = []
   const summary = simulateDepositExecution(parameters)
   const adapter = getChainAddresses(parameters.chainId as ChainId).bundler3.generalAdapter1
-  const initialDepositAssets = summary.initialDepositAssets
+  for (const iteration of summary.iterations) {
+    if (iteration.depositAssets > 0n) {
+      callbackActions.push(
+        {
+          type: 'erc4626Deposit',
+          args: [parameters.vault, iteration.depositAssets, parameters.maxVaultSharePriceE27, adapter, false],
+        },
+        {
+          type: 'morphoSupplyCollateral',
+          args: [parameters.marketParams, maxUint256, parameters.account, [], false],
+        },
+      )
+    }
 
-  if (initialDepositAssets > 0n) {
-    callbackActions.push(
-      {
-        type: 'erc4626Deposit',
-        args: [parameters.vault, initialDepositAssets, parameters.maxVaultSharePriceE27, adapter, false],
-      },
-      {
-        type: 'morphoSupplyCollateral',
-        args: [parameters.marketParams, maxUint256, parameters.account, [], false],
-      },
-    )
-  }
+    if (iteration.borrowAssets > 0n) {
+      const minBorrowSharePriceE27 = computeMinSharePriceE27({
+        shares: iteration.borrowShares,
+        previewAssets: iteration.borrowAssets,
+        slippageBps: parameters.borrowSlippageBps,
+      })
 
-  if (summary.finalBorrowAssets > 0n) {
-    const minBorrowSharePriceE27 = computeMinSharePriceE27({
-      shares: summary.finalBorrowShares,
-      previewAssets: summary.finalBorrowAssets,
-      slippageBps: parameters.borrowSlippageBps,
-    })
-
-    callbackActions.push({
-      type: 'morphoBorrow',
-      args: [
-        parameters.marketParams,
-        summary.finalBorrowAssets,
-        0n,
-        minBorrowSharePriceE27,
-        adapter,
-        false,
-      ],
-    })
+      callbackActions.push({
+        type: 'morphoBorrow',
+        args: [
+          parameters.marketParams,
+          iteration.borrowAssets,
+          0n,
+          minBorrowSharePriceE27,
+          adapter,
+          false,
+        ],
+      })
+    }
   }
 
   return { callbackActions, summary }
@@ -635,14 +655,26 @@ function simulateSingleExecution(parameters: MorphoBundlerRedeemParameters): Mor
 }
 
 function simulateDepositExecution(parameters: MorphoBundlerDepositParameters): MorphoBundlerDepositSummary {
-  const initialDepositAssets = parameters.walletAssets + parameters.flashAssets
+  const initialAvailableLoanToken = parameters.walletAssets + parameters.flashAssets
   const currentBorrowAssets = parameters.accrualPosition.borrowAssets
   const additionalBorrowTarget = parameters.targetBorrowAssets - currentBorrowAssets
   let working = cloneAccrualPosition(parameters.accrualPosition)
+  let availableLoanToken = initialAvailableLoanToken
+  let remainingDepositAssets = parameters.targetDepositAssets
+  let remainingBorrowAssets = additionalBorrowTarget
+  let remainingMorphoCallbackBalance =
+    parameters.flashLoanLiquidityAssets > parameters.flashAssets
+      ? parameters.flashLoanLiquidityAssets - parameters.flashAssets
+      : 0n
+  let remainingMarketBorrowLiquidity = parameters.marketBorrowLiquidityAssets
   let totalDepositAssets = 0n
   let suppliedCollateralAssets = 0n
-  let finalBorrowAssets = 0n
-  let finalBorrowShares = 0n
+  let totalBorrowAssets = 0n
+  let totalBorrowShares = 0n
+  const iterations: MorphoBundlerDepositLoopIteration[] = []
+  const maxIterations = 24
+  let maxSafeBorrowAfterInitialDeposit = currentBorrowAssets
+  let initialDepositAssets = 0n
 
   const supplyDepositedAssets = (assets: bigint) => {
     if (assets <= 0n) return 0n
@@ -657,68 +689,174 @@ function simulateDepositExecution(parameters: MorphoBundlerDepositParameters): M
     suppliedCollateralAssets += estimatedShares
     return estimatedShares
   }
+  const findSafeBorrowAssets = (position: AccrualPosition, requestedBorrowAssets: bigint) => {
+    if (requestedBorrowAssets <= 0n) return 0n
 
-  supplyDepositedAssets(initialDepositAssets)
+    try {
+      position.borrow(requestedBorrowAssets, 0n)
+      return requestedBorrowAssets
+    } catch {
+      let low = 0n
+      let high = requestedBorrowAssets
+      let best = 0n
 
-  const maxSafeBorrowAfterInitialDeposit = working.borrowAssets + (working.getBorrowCapacityLimit()?.value ?? 0n)
-  const callbackBorrowLiquidityAfterFlash =
-    parameters.morphoLiquidityAssets > parameters.flashAssets ? parameters.morphoLiquidityAssets - parameters.flashAssets : 0n
-  const maxAdditionalBorrowAfterConstraints = minBigInt(
-    maxSafeBorrowAfterInitialDeposit - currentBorrowAssets,
-    callbackBorrowLiquidityAfterFlash,
-  )
-  const maxTargetBorrowAssetsAfterConstraints = currentBorrowAssets + maxAdditionalBorrowAfterConstraints
+      for (let index = 0; index < 24 && low < high; index += 1) {
+        const mid = low + (high - low + 1n) / 2n
 
-  if (additionalBorrowTarget > 0n) {
-    const borrowCapacity = working.getBorrowCapacityLimit()?.value ?? 0n
-    if (additionalBorrowTarget > borrowCapacity || additionalBorrowTarget > callbackBorrowLiquidityAfterFlash) {
-      return {
-        walletAssetsIn: parameters.walletAssets,
-        flashAssets: parameters.flashAssets,
-        currentBorrowAssets,
-        targetBorrowAssets: parameters.targetBorrowAssets,
-        initialDepositAssets,
-        totalDepositAssets,
-        suppliedCollateralAssets,
-        additionalBorrowAssets: 0n,
-        maxSafeBorrowAfterInitialDeposit,
-        callbackBorrowLiquidityAfterFlash,
-        maxTargetBorrowAssetsAfterConstraints,
-        finalBorrowAssets: 0n,
-        finalBorrowShares: 0n,
-        netLoanTokenOut: 0n,
-        finalPosition: working,
-        completed: false,
-        message:
-          additionalBorrowTarget > callbackBorrowLiquidityAfterFlash
-            ? 'Requested target borrow exceeds Morpho callback liquidity after the flash loan. Reduce Flash assets or lower Target borrow after.'
-            : 'Requested target borrow exceeds the safe borrow capacity after the initial collateral deposit. Reduce Flash assets, lower Target borrow after, or increase Wallet assets in.',
+        try {
+          position.borrow(mid, 0n)
+          best = mid
+          low = mid
+        } catch {
+          high = mid - 1n
+        }
+      }
+
+      return best
+    }
+  }
+
+  const callbackBorrowLiquidityAfterFlash = minBigInt(remainingMarketBorrowLiquidity, remainingMorphoCallbackBalance)
+
+  if (parameters.targetDepositAssets > parameters.walletAssets + additionalBorrowTarget) {
+    const remainingBorrowCapacity = working.getBorrowCapacityLimit()?.value ?? 0n
+    const safeAdditionalBorrowCapacity = findSafeBorrowAssets(
+      working,
+      minBigInt(remainingBorrowCapacity, callbackBorrowLiquidityAfterFlash),
+    )
+    const maxTargetBorrowAssetsAfterConstraints =
+      working.borrowAssets + safeAdditionalBorrowCapacity
+
+    return {
+      walletAssetsIn: parameters.walletAssets,
+      flashAssets: parameters.flashAssets,
+      currentBorrowAssets,
+      targetDepositAssets: parameters.targetDepositAssets,
+      targetBorrowAssets: parameters.targetBorrowAssets,
+      initialDepositAssets: 0n,
+      totalDepositAssets: 0n,
+      suppliedCollateralAssets: 0n,
+      additionalBorrowAssets: 0n,
+      maxSafeBorrowAfterInitialDeposit,
+      callbackBorrowLiquidityAfterFlash,
+      maxTargetBorrowAssetsAfterConstraints,
+      finalBorrowAssets: 0n,
+      finalBorrowShares: 0n,
+      netLoanTokenOut: 0n,
+      finalPosition: working,
+      loopEnabled: parameters.targetDepositAssets > initialAvailableLoanToken,
+      iterationCount: 0,
+      iterations,
+      completed: false,
+      message:
+        'Requested target deposit exceeds wallet assets plus the requested final additional borrow. Increase Wallet assets in or raise Target borrow after.',
+    }
+  }
+
+  for (let index = 0; index < maxIterations; index += 1) {
+    if (remainingDepositAssets === 0n && remainingBorrowAssets === 0n) break
+
+    const depositAssets = minBigInt(availableLoanToken, remainingDepositAssets)
+    const depositShares = supplyDepositedAssets(depositAssets)
+    if (depositAssets > 0n) {
+      availableLoanToken -= depositAssets
+      remainingDepositAssets -= depositAssets
+      if (iterations.length === 0) {
+        initialDepositAssets = depositAssets
+        maxSafeBorrowAfterInitialDeposit =
+          working.borrowAssets + findSafeBorrowAssets(working, working.getBorrowCapacityLimit()?.value ?? 0n)
       }
     }
 
-    const borrowResult = working.borrow(additionalBorrowTarget, 0n)
-    working = borrowResult.position
-    finalBorrowAssets = borrowResult.assets
-    finalBorrowShares = borrowResult.shares
+    const borrowCapacity = working.getBorrowCapacityLimit()?.value ?? 0n
+    const remainingCallbackBorrowLiquidity = minBigInt(remainingMarketBorrowLiquidity, remainingMorphoCallbackBalance)
+    const requestedBorrowAssets = minBigInt(
+      minBigInt(remainingBorrowAssets, borrowCapacity),
+      remainingCallbackBorrowLiquidity,
+    )
+    const borrowAssets = findSafeBorrowAssets(working, requestedBorrowAssets)
+    let borrowShares = 0n
+
+    if (borrowAssets > 0n) {
+      const borrowResult = working.borrow(borrowAssets, 0n)
+      working = borrowResult.position
+      borrowShares = borrowResult.shares
+      availableLoanToken += borrowResult.assets
+      remainingBorrowAssets -= borrowResult.assets
+      remainingMorphoCallbackBalance -= borrowResult.assets
+      remainingMarketBorrowLiquidity -= borrowResult.assets
+      totalBorrowAssets += borrowResult.assets
+      totalBorrowShares += borrowResult.shares
+    }
+
+    iterations.push({
+      index,
+      depositAssets,
+      depositShares,
+      borrowAssets,
+      borrowShares,
+      loanTokenBalanceAfter: availableLoanToken,
+      totalDepositAssetsAfter: totalDepositAssets,
+      totalBorrowAssetsAfter: totalBorrowAssets,
+      borrowAssetsAfter: working.borrowAssets,
+      borrowSharesAfter: working.borrowShares,
+      collateralAfter: working.collateral,
+    })
+
+    if (depositAssets === 0n && borrowAssets === 0n) {
+      break
+    }
+  }
+
+  const remainingBorrowCapacity = working.getBorrowCapacityLimit()?.value ?? 0n
+  const remainingCallbackBorrowLiquidity = minBigInt(remainingMarketBorrowLiquidity, remainingMorphoCallbackBalance)
+  const safeAdditionalBorrowCapacity = findSafeBorrowAssets(
+    working,
+    minBigInt(remainingBorrowCapacity, remainingCallbackBorrowLiquidity),
+  )
+  const maxTargetBorrowAssetsAfterConstraints =
+    working.borrowAssets + safeAdditionalBorrowCapacity
+  const completed = remainingDepositAssets === 0n && remainingBorrowAssets === 0n
+  const usedLoop = iterations.length > 1 || parameters.targetDepositAssets > initialAvailableLoanToken
+
+  let message: string | undefined
+  if (!completed) {
+    if (remainingBorrowAssets > 0n && remainingCallbackBorrowLiquidity === 0n) {
+      message =
+        'Requested target borrow exceeds callback borrow liquidity after the flash loan even after attempting deposit looping. Reduce Flash assets or lower Target borrow after.'
+    } else if (remainingBorrowAssets > 0n && remainingBorrowCapacity === 0n) {
+      message =
+        'Deposit loop reached the safe borrow limit before the requested target borrow was reached. Increase Wallet assets in, reduce Target deposit, or lower Target borrow after.'
+    } else if (remainingDepositAssets > 0n && availableLoanToken === 0n && remainingBorrowAssets === 0n) {
+      message =
+        'Deposit loop ran out of loan-token balance before the requested target deposit was reached. Increase Wallet assets in or raise Target borrow after.'
+    } else {
+      message = 'Deposit loop hit the configured iteration limit before the requested target was completed.'
+    }
   }
 
   return {
     walletAssetsIn: parameters.walletAssets,
     flashAssets: parameters.flashAssets,
     currentBorrowAssets,
+    targetDepositAssets: parameters.targetDepositAssets,
     targetBorrowAssets: parameters.targetBorrowAssets,
     initialDepositAssets,
     totalDepositAssets,
     suppliedCollateralAssets,
-    additionalBorrowAssets: finalBorrowAssets,
+    additionalBorrowAssets: totalBorrowAssets,
     maxSafeBorrowAfterInitialDeposit,
     callbackBorrowLiquidityAfterFlash,
     maxTargetBorrowAssetsAfterConstraints,
-    finalBorrowAssets,
-    finalBorrowShares,
-    netLoanTokenOut: finalBorrowAssets > parameters.flashAssets ? finalBorrowAssets - parameters.flashAssets : 0n,
+    finalBorrowAssets: totalBorrowAssets,
+    finalBorrowShares: totalBorrowShares,
+    netLoanTokenOut: availableLoanToken > parameters.flashAssets ? availableLoanToken - parameters.flashAssets : 0n,
     finalPosition: working,
-    completed: true,
+    loopEnabled: usedLoop,
+    iterationCount: iterations.length,
+    iterations,
+    completed,
+    message,
   }
 }
 
@@ -982,13 +1120,17 @@ function assertRedeemParameters(parameters: MorphoBundlerRedeemParameters) {
 }
 
 function assertDepositParameters(parameters: MorphoBundlerDepositParameters) {
-  if (parameters.morphoLiquidityAssets < 0n) throw new Error('morphoLiquidityAssets cannot be negative.')
+  if (parameters.flashLoanLiquidityAssets < 0n) throw new Error('flashLoanLiquidityAssets cannot be negative.')
+  if (parameters.marketBorrowLiquidityAssets < 0n) throw new Error('marketBorrowLiquidityAssets cannot be negative.')
   if (parameters.walletAssets < 0n) throw new Error('walletAssets cannot be negative.')
   if (parameters.flashAssets < 0n) throw new Error('flashAssets cannot be negative.')
-  if (parameters.walletAssets + parameters.flashAssets <= 0n) {
-    throw new Error('walletAssets + flashAssets must be greater than zero.')
+  if (parameters.targetDepositAssets <= 0n) {
+    throw new Error('targetDepositAssets must be greater than zero.')
   }
-  if (parameters.flashAssets > parameters.morphoLiquidityAssets) {
+  if (parameters.walletAssets + parameters.flashAssets <= 0n) {
+    throw new Error('walletAssets + flashAssets must be greater than zero for the initial deposit leg.')
+  }
+  if (parameters.flashAssets > parameters.flashLoanLiquidityAssets) {
     throw new Error('flashAssets exceed Morpho current loan-token liquidity.')
   }
   if (parameters.targetBorrowAssets < parameters.accrualPosition.borrowAssets) {

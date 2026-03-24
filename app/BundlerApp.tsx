@@ -92,6 +92,7 @@ type BaseSnapshot = {
   loanTokenDecimals: number
   collateralTokenDecimals: number
   maxFlashLoanAssets: bigint
+  marketBorrowLiquidityAssets: bigint
   walletLoanTokenBalance: bigint
   walletLoanTokenAllowanceToAdapter: bigint
 }
@@ -129,6 +130,7 @@ type DepositExecutionPreview = {
   kind: 'deposit'
   walletAssetsIn: bigint
   currentBorrowAssets: bigint
+  targetDepositAssets: bigint
   targetBorrowAssets: bigint
   flashAssets: bigint
   initialDepositAssets: bigint
@@ -142,6 +144,14 @@ type DepositExecutionPreview = {
   finalBorrowAssets: bigint
   netLoanTokenOut: bigint
   finalPosition: AccrualPosition
+  loopEnabled: boolean
+  iterationCount: number
+  iterations: Array<{
+    index: number
+    depositAssets: bigint
+    borrowAssets: bigint
+    loanTokenBalanceAfter: bigint
+  }>
   completed: boolean
   message?: string
 }
@@ -157,6 +167,34 @@ type DepositAutoLeveragePoint = {
 type DepositRiskConstraints = {
   maxLtvAfter?: bigint
   minHealthAfter?: bigint
+}
+
+type ResolvedDepositSizing = {
+  walletAssets: bigint
+  flashAssets: bigint
+  totalDepositAssets: bigint
+  finalBorrowAssets: bigint
+  targetBorrowAssets: bigint
+  autoDerivedWalletAssets: boolean
+  autoDerivedFlashAssets: boolean
+  autoDerivedTotalDepositAssets: boolean
+}
+
+type DepositConstraintPreview = {
+  maxTargetBorrowAssetsAtCurrentFlash: bigint
+  maxFlashAssetsAtCurrentTarget: bigint
+  maxSafeBorrowAfterInitialDeposit: bigint
+  callbackBorrowLiquidityAfterFlash: bigint
+  marketBorrowLiquidityAssets: bigint
+}
+
+type ResolvedDepositStrategy = {
+  requestedSizing: ResolvedDepositSizing
+  solvedSizing: ResolvedDepositSizing
+  requestedPlan: Awaited<ReturnType<typeof buildMorphoBundlerDepositPlan>>
+  solvedPlan: Awaited<ReturnType<typeof buildMorphoBundlerDepositPlan>>
+  autoAdjustedFlashAssets: boolean
+  autoAdjustmentMessage?: string
 }
 
 type ExecutionPreview = RedeemExecutionPreview | DepositExecutionPreview
@@ -245,8 +283,10 @@ export function BundlerApp() {
   const [builderMode, setBuilderMode] = useState<BuilderMode>('redeem')
   const [repayMode, setRepayMode] = useState<RepayMode>('full-shares')
   const [flashAssets, setFlashAssets] = useState<string>('0')
-  const [walletAssets, setWalletAssets] = useState<string>('0')
-  const [targetBorrowAssets, setTargetBorrowAssets] = useState<string>('0')
+  const [depositFlashLoanAssets, setDepositFlashLoanAssets] = useState<string>('')
+  const [depositWalletAssets, setDepositWalletAssets] = useState<string>('')
+  const [depositFinalAmount, setDepositFinalAmount] = useState<string>('')
+  const [depositFinalBorrowAmount, setDepositFinalBorrowAmount] = useState<string>('')
   const [repayAssets, setRepayAssets] = useState<string>('9000')
   const [withdrawAllCollateral, setWithdrawAllCollateral] = useState<boolean>(true)
   const [withdrawCollateralAssets, setWithdrawCollateralAssets] = useState<string>('0')
@@ -254,14 +294,9 @@ export function BundlerApp() {
   const [depositSlippageBps, setDepositSlippageBps] = useState<string>('30')
   const [maxLtvAfter, setMaxLtvAfter] = useState<string>('')
   const [minHealthAfter, setMinHealthAfter] = useState<string>('')
-  const [targetUtilizationAfter, setTargetUtilizationAfter] = useState<string>('')
   const [redeemSlippageBps, setRedeemSlippageBps] = useState<string>('30')
   const [authorizationDeadlineMinutes, setAuthorizationDeadlineMinutes] = useState<string>('30')
   const [autoRevoke, setAutoRevoke] = useState<boolean>(true)
-  const [depositAutoLeveragePoints, setDepositAutoLeveragePoints] = useState<DepositAutoLeveragePoint[]>([])
-  const [depositAutoLeverageIndex, setDepositAutoLeverageIndex] = useState<number>(0)
-  const [depositAutoLeverageLoading, setDepositAutoLeverageLoading] = useState<boolean>(false)
-  const [depositAutoLeverageError, setDepositAutoLeverageError] = useState<string>('')
 
   const [redeemAutoPoints, setRedeemAutoPoints] = useState<RedeemAutoPoint[]>([])
   const [redeemAutoIndex, setRedeemAutoIndex] = useState<number>(20)
@@ -293,6 +328,151 @@ export function BundlerApp() {
     marketIdInput.trim().toLowerCase() === resolvedMarketIdInput &&
     !resolvingMarketConfig &&
     !marketConfigError
+  const resolvedDepositSizing = useMemo<{ result: ResolvedDepositSizing | null; error: string }>(() => {
+    if (builderMode !== 'deposit' || !baseSnapshot) return { result: null, error: '' }
+
+    try {
+      return {
+        result: resolveDepositSizing({
+          walletAssets: depositWalletAssets,
+          flashAssets: depositFlashLoanAssets,
+          totalDepositAssets: depositFinalAmount,
+          finalBorrowAssets: depositFinalBorrowAmount,
+          snapshot: baseSnapshot,
+          loanTokenDecimals: baseSnapshot.loanTokenDecimals,
+        }),
+        error: '',
+      }
+    } catch (error) {
+      return {
+        result: null,
+        error: error instanceof Error ? error.message : 'Failed to size the deposit inputs.',
+      }
+    }
+  }, [
+    baseSnapshot,
+    builderMode,
+    depositFinalAmount,
+    depositFinalBorrowAmount,
+    depositFlashLoanAssets,
+    depositWalletAssets,
+  ])
+  const resolvedDepositStrategy = useMemo<{ result: ResolvedDepositStrategy | null; error: string }>(() => {
+    if (
+      builderMode !== 'deposit' ||
+      !account ||
+      !baseSnapshot ||
+      !resolvedDepositSizing.result ||
+      !vaultSnapshot ||
+      !isAddress(vaultAddress)
+    ) {
+      return { result: null, error: '' }
+    }
+
+    try {
+      if (!vaultSnapshot.asset || vaultSnapshot.asset.toLowerCase() !== baseSnapshot.marketParams.loanToken.toLowerCase()) {
+        return { result: null, error: '' }
+      }
+
+      return {
+        result: resolveDepositStrategy({
+          chainId,
+          account: assertAddress(account),
+          snapshot: baseSnapshot,
+          vault: assertAddress(vaultAddress),
+          requestedSizing: resolvedDepositSizing.result,
+          previewDepositShares: vaultSnapshot.previewDepositShares,
+          depositSlippageBps: parseBps(depositSlippageBps),
+          authorizationDeadline: 1n,
+          autoRevoke,
+        }),
+        error: '',
+      }
+    } catch (error) {
+      return {
+        result: null,
+        error: error instanceof Error ? error.message : 'Failed to resolve the leverage loop strategy.',
+      }
+    }
+  }, [
+    account,
+    autoRevoke,
+    baseSnapshot,
+    builderMode,
+    chainId,
+    depositSlippageBps,
+    resolvedDepositSizing.result,
+    vaultAddress,
+    vaultSnapshot,
+  ])
+  const depositConstraintPreview = useMemo<{ result: DepositConstraintPreview | null; error: string }>(() => {
+    if (
+      builderMode !== 'deposit' ||
+      !account ||
+      !baseSnapshot ||
+      !resolvedDepositStrategy.result ||
+      !vaultSnapshot ||
+      !isAddress(vaultAddress)
+    ) {
+      return { result: null, error: '' }
+    }
+
+    try {
+      if (!vaultSnapshot.asset || vaultSnapshot.asset.toLowerCase() !== baseSnapshot.marketParams.loanToken.toLowerCase()) {
+        return { result: null, error: '' }
+      }
+
+      const requestedSizing = resolvedDepositStrategy.result.requestedSizing
+      const plan = resolvedDepositStrategy.result.requestedPlan
+
+      const currentBorrowAssets = baseSnapshot.borrowAssets
+      const additionalBorrowTarget =
+        requestedSizing.targetBorrowAssets > currentBorrowAssets
+          ? requestedSizing.targetBorrowAssets - currentBorrowAssets
+          : 0n
+      const maxFlashByCallback =
+        additionalBorrowTarget > baseSnapshot.marketBorrowLiquidityAssets || additionalBorrowTarget > baseSnapshot.maxFlashLoanAssets
+          ? 0n
+          : baseSnapshot.maxFlashLoanAssets - additionalBorrowTarget
+      const maxFlashByRepayment = additionalBorrowTarget
+      const maxFlashByDepositSize = requestedSizing.totalDepositAssets
+      const maxFlashAssetsAtCurrentTarget =
+        requestedSizing.targetBorrowAssets > plan.summary.maxSafeBorrowAfterInitialDeposit
+          ? 0n
+          : minBigInt(
+              minBigInt(maxFlashByCallback, maxFlashByRepayment),
+              minBigInt(maxFlashByDepositSize, baseSnapshot.maxFlashLoanAssets),
+            )
+
+      return {
+        result: {
+          maxTargetBorrowAssetsAtCurrentFlash: plan.summary.maxTargetBorrowAssetsAfterConstraints,
+          maxFlashAssetsAtCurrentTarget,
+          maxSafeBorrowAfterInitialDeposit: plan.summary.maxSafeBorrowAfterInitialDeposit,
+          callbackBorrowLiquidityAfterFlash: plan.summary.callbackBorrowLiquidityAfterFlash,
+          marketBorrowLiquidityAssets: baseSnapshot.marketBorrowLiquidityAssets,
+        },
+        error: '',
+      }
+    } catch (error) {
+      return {
+        result: null,
+        error: error instanceof Error ? error.message : 'Failed to compute the current deposit limits.',
+      }
+    }
+  }, [
+    account,
+    autoRevoke,
+    baseSnapshot,
+    builderMode,
+    chainId,
+    depositSlippageBps,
+    resolvedDepositStrategy.result,
+    vaultAddress,
+    vaultSnapshot,
+  ])
+  const activeDepositStrategy = resolvedDepositStrategy.result
+  const activeDepositSizing = activeDepositStrategy?.solvedSizing ?? resolvedDepositSizing.result
 
   useEffect(() => {
     const syncProviders = () => {
@@ -544,11 +724,7 @@ export function BundlerApp() {
           : 0n
       const depositAssets =
         builderMode === 'deposit'
-          ? readDepositAssets({
-              walletAssets,
-              flashAssets,
-              loanTokenDecimals,
-            })
+          ? resolvedDepositSizing.result?.totalDepositAssets ?? 0n
           : 0n
 
       if (
@@ -577,143 +753,12 @@ export function BundlerApp() {
     vaultAddress,
     flashAssets,
     loanTokenDecimals,
-    walletAssets,
+    resolvedDepositSizing.result,
     withdrawAllCollateral,
     withdrawCollateralAssets,
     collateralTokenDecimals,
     baseSnapshot?.collateral,
   ])
-
-  useEffect(() => {
-    if (builderMode !== 'deposit' || !baseSnapshot) return
-
-    let shouldHydrateTargetBorrow = !targetBorrowAssets.trim()
-    if (!shouldHydrateTargetBorrow) {
-      try {
-        shouldHydrateTargetBorrow = parseUnits(targetBorrowAssets, baseSnapshot.loanTokenDecimals) === 0n
-      } catch {
-        shouldHydrateTargetBorrow = true
-      }
-    }
-    if (!shouldHydrateTargetBorrow) return
-
-    try {
-      const flashAssetsValue = parseUnits(flashAssets || '0', baseSnapshot.loanTokenDecimals)
-      setTargetBorrowAssets(formatUnits(baseSnapshot.borrowAssets + flashAssetsValue, baseSnapshot.loanTokenDecimals))
-    } catch {
-      // Ignore parse failures while the user is editing and keep the existing field value.
-    }
-  }, [baseSnapshot, builderMode, flashAssets, targetBorrowAssets])
-
-  useEffect(() => {
-    if (builderMode !== 'deposit') {
-      setDepositAutoLeverageLoading(false)
-      setDepositAutoLeverageError('')
-      setDepositAutoLeveragePoints([])
-      setDepositAutoLeverageIndex(0)
-      return
-    }
-    if (!selectedProvider || !account || !baseSnapshot || !isCurrentChainSupported || !isAddress(vaultAddress)) {
-      setDepositAutoLeverageLoading(false)
-      setDepositAutoLeverageError('')
-      setDepositAutoLeveragePoints([])
-      setDepositAutoLeverageIndex(0)
-      return
-    }
-
-    let cancelled = false
-    const previousPointsLength = depositAutoLeveragePoints.length
-    setDepositAutoLeverageLoading(true)
-    setDepositAutoLeverageError('')
-
-    const timeoutId = window.setTimeout(() => {
-      void (async () => {
-        try {
-          const walletAssetsValue = walletAssets.trim() ? parseUnits(walletAssets, baseSnapshot.loanTokenDecimals) : 0n
-          if (walletAssetsValue > baseSnapshot.walletLoanTokenBalance) {
-            throw new Error(
-              `Wallet assets exceed the connected wallet balance. Available balance is ${formatUnits(
-                baseSnapshot.walletLoanTokenBalance,
-                baseSnapshot.loanTokenDecimals,
-              )} ${baseSnapshot.loanTokenSymbol}.`,
-            )
-          }
-
-          const nextPoints = await computeDepositAutoLeveragePoints({
-            walletAssetsValue,
-          })
-          if (cancelled) return
-
-          let currentFlashAssetsValue: bigint | null = null
-          let currentTargetBorrowAssetsValue: bigint | null = null
-          try {
-            currentFlashAssetsValue = flashAssets.trim() ? parseUnits(flashAssets, baseSnapshot.loanTokenDecimals) : 0n
-          } catch {
-            currentFlashAssetsValue = null
-          }
-          try {
-            currentTargetBorrowAssetsValue = targetBorrowAssets.trim()
-              ? parseUnits(targetBorrowAssets, baseSnapshot.loanTokenDecimals)
-              : baseSnapshot.borrowAssets
-          } catch {
-            currentTargetBorrowAssetsValue = null
-          }
-
-          setDepositAutoLeveragePoints(nextPoints)
-          setDepositAutoLeverageIndex(
-            previousPointsLength > 0
-              ? findClosestDepositAutoLeveragePoint({
-                  points: nextPoints,
-                  flashAssets: currentFlashAssetsValue,
-                  targetBorrowAssets: currentTargetBorrowAssetsValue,
-                })
-              : 0,
-          )
-        } catch (error) {
-          if (cancelled) return
-          setDepositAutoLeveragePoints([])
-          setDepositAutoLeverageIndex(0)
-          setDepositAutoLeverageError(
-            error instanceof Error ? error.message : 'Failed to compute the current auto-leverage range.',
-          )
-        } finally {
-          if (!cancelled) setDepositAutoLeverageLoading(false)
-        }
-      })()
-    }, 250)
-
-    return () => {
-      cancelled = true
-      window.clearTimeout(timeoutId)
-    }
-  }, [
-    account,
-    baseSnapshot,
-    builderMode,
-    chainId,
-    depositSlippageBps,
-    isCurrentChainSupported,
-    maxLtvAfter,
-    minHealthAfter,
-    selectedProvider,
-    vaultAddress,
-    walletAssets,
-  ])
-
-  useEffect(() => {
-    if (builderMode !== 'deposit' || !baseSnapshot) return
-
-    const point = depositAutoLeveragePoints[clampNumber(depositAutoLeverageIndex, 0, depositAutoLeveragePoints.length - 1)]
-    if (!point) return
-
-    const nextFlashAssets = formatUnits(point.flashAssets, baseSnapshot.loanTokenDecimals)
-    const nextTargetBorrowAssets = formatUnits(point.targetBorrowAssets, baseSnapshot.loanTokenDecimals)
-
-    setFlashAssets((currentValue) => (currentValue === nextFlashAssets ? currentValue : nextFlashAssets))
-    setTargetBorrowAssets((currentValue) =>
-      currentValue === nextTargetBorrowAssets ? currentValue : nextTargetBorrowAssets,
-    )
-  }, [baseSnapshot, builderMode, depositAutoLeverageIndex, depositAutoLeveragePoints])
 
   // Compute redeem auto points whenever relevant inputs change
   useEffect(() => {
@@ -786,23 +831,6 @@ export function BundlerApp() {
     setWithdrawCollateralAssets((v) => (v === nextWithdrawCollateral ? v : nextWithdrawCollateral))
   }, [builderMode, redeemAutoIndex, redeemAutoPoints, baseSnapshot])
 
-  useEffect(() => {
-    if (builderMode !== 'deposit') {
-      setTargetUtilizationAfter('')
-      return
-    }
-    const point = depositAutoLeveragePoints[clampNumber(depositAutoLeverageIndex, 0, depositAutoLeveragePoints.length - 1)]
-    if (!point) return
-
-    const nextValue = formatWadPercentValue(point.utilizationAfter)
-    setTargetUtilizationAfter((currentValue) => (currentValue === nextValue ? currentValue : nextValue))
-  }, [builderMode, depositAutoLeverageIndex, depositAutoLeveragePoints])
-
-  const activeDepositAutoLeveragePoint =
-    builderMode === 'deposit'
-      ? depositAutoLeveragePoints[clampNumber(depositAutoLeverageIndex, 0, depositAutoLeveragePoints.length - 1)] ?? null
-      : null
-
   const activeRedeemAutoPoint =
     builderMode === 'redeem'
       ? redeemAutoPoints[clampNumber(redeemAutoIndex, 0, redeemAutoPoints.length - 1)] ?? null
@@ -829,26 +857,30 @@ export function BundlerApp() {
       if (!baseSnapshot) {
         return { error: snapshotError || 'Refresh the onchain snapshot first.', plan: null, warnings: [] }
       }
-      if (builderMode === 'deposit' && depositAutoLeverageLoading) {
-        return { error: 'Refreshing the auto-leverage path…', plan: null, warnings: [] }
-      }
-      if (builderMode === 'deposit' && !activeDepositAutoLeveragePoint) {
+      if (builderMode === 'deposit' && resolvedDepositSizing.error) {
         return {
-          error: depositAutoLeverageError || 'Auto leverage is not ready yet.',
+          error: resolvedDepositSizing.error,
           plan: null,
           warnings: [],
         }
       }
-      if (builderMode === 'redeem' && !vaultSnapshot) {
+      if (builderMode === 'deposit' && resolvedDepositStrategy.error) {
+        return {
+          error: resolvedDepositStrategy.error,
+          plan: null,
+          warnings: [],
+        }
+      }
+      if (!vaultSnapshot) {
         return { error: vaultError || 'Vault preview is not ready yet.', plan: null, warnings: [] }
       }
 
       const marketParams = parseMarketParams({ loanToken, collateralToken, oracle, irm, lltv })
       const vault = assertAddress(vaultAddress)
       const redeemVaultSnapshot = builderMode === 'redeem' ? vaultSnapshot : null
-      const depositAutoPoint = builderMode === 'deposit' ? activeDepositAutoLeveragePoint : null
-      const flashAssetsValue = parseUnits(flashAssets || '0', Number(loanTokenDecimals))
-      if (flashAssetsValue > baseSnapshot.maxFlashLoanAssets) {
+      const depositVaultSnapshot = builderMode === 'deposit' ? vaultSnapshot : null
+      const redeemFlashAssetsValue = builderMode === 'redeem' ? parseUnits(flashAssets || '0', Number(loanTokenDecimals)) : 0n
+      if (builderMode === 'redeem' && redeemFlashAssetsValue > baseSnapshot.maxFlashLoanAssets) {
         throw new Error(
           `Requested flash assets exceed Morpho's available flash-loan liquidity. Max available is ${formatUnits(
             baseSnapshot.maxFlashLoanAssets,
@@ -856,10 +888,7 @@ export function BundlerApp() {
           )} ${baseSnapshot.loanTokenSymbol}.`,
         )
       }
-      if (
-        builderMode === 'redeem' &&
-        (!vaultSnapshot?.asset || vaultSnapshot.asset.toLowerCase() !== marketParams.loanToken.toLowerCase())
-      ) {
+      if (!vaultSnapshot.asset || vaultSnapshot.asset.toLowerCase() !== marketParams.loanToken.toLowerCase()) {
         throw new Error('The ERC-4626 vault asset must match the Morpho loan token for this builder.')
       }
       const authorizationDeadline =
@@ -882,7 +911,7 @@ export function BundlerApp() {
         if (withdrawShares > baseSnapshot.collateral) {
           throw new Error('Withdraw collateral assets exceed the current Morpho collateral balance.')
         }
-        if (repayMode === 'exact-assets' && flashAssetsValue < (repayAssetsValue ?? 0n)) {
+        if (repayMode === 'exact-assets' && redeemFlashAssetsValue < (repayAssetsValue ?? 0n)) {
           throw new Error('flashAssets must be at least repayAssets in exact-assets mode.')
         }
 
@@ -899,7 +928,7 @@ export function BundlerApp() {
           account: assertAddress(account),
           marketParams,
           vault,
-          flashAssets: flashAssetsValue,
+          flashAssets: redeemFlashAssetsValue,
           repayMode,
           repayAssets: repayAssetsValue,
           withdrawCollateralAssets: withdrawShares,
@@ -972,14 +1001,17 @@ export function BundlerApp() {
         }
       }
 
-      const walletAssetsValue = parseUnits(walletAssets || '0', Number(loanTokenDecimals))
-      const totalDepositAssets = walletAssetsValue + flashAssetsValue
-      const targetBorrowAssetsValue = targetBorrowAssets.trim()
-        ? parseUnits(targetBorrowAssets, Number(loanTokenDecimals))
-        : baseSnapshot.borrowAssets + flashAssetsValue
-      if (totalDepositAssets <= 0n) {
-        throw new Error('Wallet assets plus flash assets must be greater than zero.')
+      const depositSizing = activeDepositSizing
+      const depositStrategy = activeDepositStrategy
+      if (!depositSizing || !depositStrategy) {
+        throw new Error('Deposit sizing is not ready yet.')
       }
+
+      const walletAssetsValue = depositSizing.walletAssets
+      const flashAssetsValue = depositSizing.flashAssets
+      const totalDepositAssets = depositSizing.totalDepositAssets
+      const targetBorrowAssetsValue = depositSizing.targetBorrowAssets
+
       if (walletAssetsValue > baseSnapshot.walletLoanTokenBalance) {
         throw new Error(
           `Wallet assets exceed the connected wallet balance. Available balance is ${formatUnits(
@@ -999,44 +1031,38 @@ export function BundlerApp() {
 
       const maxVaultSharePriceE27 = computeMaxSharePriceE27({
         assets: totalDepositAssets,
-        previewShares: depositAutoPoint!.previewDepositShares,
+        previewShares: depositVaultSnapshot!.previewDepositShares,
         slippageBps: parseBps(depositSlippageBps),
       })
 
-      const plan = buildMorphoBundlerDepositPlan({
-        chainId,
-        account: assertAddress(account),
-        marketParams,
-        vault,
-        morphoLiquidityAssets: baseSnapshot.maxFlashLoanAssets,
-        walletAssets: walletAssetsValue,
-        flashAssets: flashAssetsValue,
-        targetBorrowAssets: targetBorrowAssetsValue,
-        maxVaultSharePriceE27,
-        borrowSlippageBps: parseBps(depositSlippageBps),
-        authorizationNonce: baseSnapshot.morphoNonce,
-        authorizationDeadline,
-        autoRevoke,
-        skipInitialAuthorization: baseSnapshot.isBundlerAuthorized,
-        accrualPosition: baseSnapshot.accrualPosition,
-        previewDepositShares: depositAutoPoint!.previewDepositShares,
-      })
+      const plan = depositStrategy.solvedPlan
       const executionPreview = simulateDepositExecutionPreview({
         summary: plan.summary,
-        previewDepositShares: depositAutoPoint!.previewDepositShares,
+        previewDepositShares: depositVaultSnapshot!.previewDepositShares,
       })
       if (!plan.summary.completed) {
         throw new Error(plan.summary.message || 'The deposit builder could not reach the requested borrow target.')
       }
 
       const warnings: string[] = []
+      if (depositSizing.autoDerivedTotalDepositAssets) {
+        warnings.push('Final deposit amount was derived from the helper inputs because the final deposit field is blank.')
+      }
+      if (depositSizing.autoDerivedWalletAssets || depositSizing.autoDerivedFlashAssets) {
+        warnings.push('Blank wallet / flash helper fields were auto-sized to satisfy the requested final deposit and final borrow amounts.')
+      }
+      if (depositStrategy.autoAdjustedFlashAssets && depositStrategy.autoAdjustmentMessage) {
+        warnings.push(depositStrategy.autoAdjustmentMessage)
+      }
       if (!autoRevoke) {
         warnings.push('Auto-revoke is disabled. GeneralAdapter1 will stay authorized on Morpho after the bundle succeeds.')
       } else if (baseSnapshot.isBundlerAuthorized) {
         warnings.push('GeneralAdapter1 is already authorized now. With auto-revoke enabled, the account will end the transaction deauthorized.')
       }
-      if (flashAssetsValue > 0n) {
-        warnings.push('Leverage deposits wallet + flash collateral once, then borrows once. Any borrow above Flash assets is swept back to the wallet.')
+      if (plan.summary.loopEnabled) {
+        warnings.push(`Deposit loop is enabled. The bundle will iterate ${plan.summary.iterationCount} leg(s) of deposit -> supply collateral -> borrow until the target deposit and final borrow are reached.`)
+      } else if (flashAssetsValue > 0n) {
+        warnings.push('Leverage deposit uses a single deposit -> supply collateral -> borrow leg. Any borrow above Flash assets is swept back to the wallet.')
       }
       if (plan.summary.netLoanTokenOut > 0n) {
         warnings.push(
@@ -1055,8 +1081,8 @@ export function BundlerApp() {
         maxVaultSharePriceE27,
         expectedBorrowAssets: plan.summary.additionalBorrowAssets,
         targetBorrowAssets: targetBorrowAssetsValue,
-        previewAssets: plan.summary.initialDepositAssets,
-        previewShares: depositAutoPoint!.previewDepositShares,
+        previewAssets: plan.summary.totalDepositAssets,
+        previewShares: depositVaultSnapshot!.previewDepositShares,
         estimatedNetAssets: plan.summary.netLoanTokenOut,
         walletAssetsIn: walletAssetsValue,
         executionPreview,
@@ -1079,8 +1105,10 @@ export function BundlerApp() {
     collateralTokenDecimals,
     currentMorphoChain,
     depositSlippageBps,
-    depositAutoLeverageError,
-    depositAutoLeverageLoading,
+    activeDepositSizing,
+    activeDepositStrategy,
+    resolvedDepositSizing,
+    resolvedDepositStrategy,
     flashAssets,
     irm,
     isCurrentChainSupported,
@@ -1093,12 +1121,9 @@ export function BundlerApp() {
     repayAssets,
     repayMode,
     snapshotError,
-    targetBorrowAssets,
-    activeDepositAutoLeveragePoint,
     vaultAddress,
     vaultError,
     vaultSnapshot,
-    walletAssets,
     withdrawAllCollateral,
     withdrawCollateralAssets,
   ])
@@ -1111,16 +1136,6 @@ export function BundlerApp() {
   const previewEstimatedNetAssets = draft.estimatedNetAssets
   const redeemPreview = draft.executionPreview?.kind === 'redeem' ? draft.executionPreview : null
   const depositPreview = draft.executionPreview?.kind === 'deposit' ? draft.executionPreview : null
-  const depositAutoLeverageMaxPoint =
-    builderMode === 'deposit' && depositAutoLeveragePoints.length > 0
-      ? depositAutoLeveragePoints[depositAutoLeveragePoints.length - 1]
-      : null
-  const depositAutoLeverageProgress =
-    depositAutoLeveragePoints.length > 1
-      ? (clampNumber(depositAutoLeverageIndex, 0, depositAutoLeveragePoints.length - 1) /
-          (depositAutoLeveragePoints.length - 1)) *
-        100
-      : 0
   const typedDataJson = draft.plan
     ? stringifyForDisplay(
         [draft.plan.authorization.authorizeTypedData, draft.plan.authorization.revokeTypedData].filter(Boolean),
@@ -1196,20 +1211,6 @@ export function BundlerApp() {
             snapshot.loanTokenDecimals,
           ),
         )
-      }
-      if (builderMode === 'deposit') {
-        let shouldHydrateTargetBorrow = !targetBorrowAssets.trim()
-        if (!shouldHydrateTargetBorrow) {
-          try {
-            shouldHydrateTargetBorrow = parseUnits(targetBorrowAssets, snapshot.loanTokenDecimals) === 0n
-          } catch {
-            shouldHydrateTargetBorrow = true
-          }
-        }
-        if (shouldHydrateTargetBorrow) {
-          const flashAssetsValue = parseUnits(flashAssets || '0', snapshot.loanTokenDecimals)
-          setTargetBorrowAssets(formatUnits(snapshot.borrowAssets + flashAssetsValue, snapshot.loanTokenDecimals))
-        }
       }
 
       setStatus({
@@ -1313,8 +1314,8 @@ export function BundlerApp() {
         chainId,
       })
       const marketParams = freshBaseSnapshot.marketParams
-      const flashAssetsValue = parseUnits(flashAssets || '0', freshBaseSnapshot.loanTokenDecimals)
-      if (flashAssetsValue > freshBaseSnapshot.maxFlashLoanAssets) {
+      const redeemFlashAssetsValue = parseUnits(flashAssets || '0', freshBaseSnapshot.loanTokenDecimals)
+      if (builderMode === 'redeem' && redeemFlashAssetsValue > freshBaseSnapshot.maxFlashLoanAssets) {
         throw new Error(
           `Requested flash assets exceed Morpho's available flash-loan liquidity. Max available is ${formatUnits(
             freshBaseSnapshot.maxFlashLoanAssets,
@@ -1322,6 +1323,17 @@ export function BundlerApp() {
           )} ${freshBaseSnapshot.loanTokenSymbol}.`,
         )
       }
+      const freshDepositSizing =
+        builderMode === 'deposit'
+          ? resolveDepositSizing({
+              walletAssets: depositWalletAssets,
+              flashAssets: depositFlashLoanAssets,
+              totalDepositAssets: depositFinalAmount,
+              finalBorrowAssets: depositFinalBorrowAmount,
+              snapshot: freshBaseSnapshot,
+              loanTokenDecimals: freshBaseSnapshot.loanTokenDecimals,
+            })
+          : null
       const authorizationDeadline =
         BigInt(Math.floor(Date.now() / 1000)) +
         BigInt(parseUnsignedInt(authorizationDeadlineMinutes, 'Authorization deadline')) * 60n
@@ -1343,11 +1355,7 @@ export function BundlerApp() {
               provider: selectedProvider.provider,
               vault: assertAddress(vaultAddress),
               shares: 0n,
-              assets: readDepositAssets({
-                walletAssets,
-                flashAssets,
-                loanTokenDecimals: String(freshBaseSnapshot.loanTokenDecimals),
-              }),
+              assets: freshDepositSizing!.totalDepositAssets,
             })
 
       if (!freshVaultSnapshot.asset || freshVaultSnapshot.asset.toLowerCase() !== marketParams.loanToken.toLowerCase()) {
@@ -1385,7 +1393,7 @@ export function BundlerApp() {
                 account: assertAddress(account),
                 marketParams,
                 vault: assertAddress(vaultAddress),
-                flashAssets: flashAssetsValue,
+                flashAssets: redeemFlashAssetsValue,
                 repayMode,
                 repayAssets: repayAssetsValue,
                 withdrawCollateralAssets: withdrawShares,
@@ -1403,43 +1411,32 @@ export function BundlerApp() {
               return nextPlan
             })()
           : (() => {
-              const walletAssetsValue = parseUnits(walletAssets || '0', freshBaseSnapshot.loanTokenDecimals)
-              const totalDepositAssets = walletAssetsValue + flashAssetsValue
-              const targetBorrowAssetsValue = targetBorrowAssets.trim()
-                ? parseUnits(targetBorrowAssets || '0', freshBaseSnapshot.loanTokenDecimals)
-                : freshBaseSnapshot.borrowAssets + flashAssetsValue
-              if (totalDepositAssets <= 0n) {
-                throw new Error('Wallet assets plus flash assets must be greater than zero.')
-              }
+              const depositStrategy = resolveDepositStrategy({
+                chainId,
+                account: assertAddress(account),
+                snapshot: freshBaseSnapshot,
+                vault: assertAddress(vaultAddress),
+                requestedSizing: freshDepositSizing!,
+                previewDepositShares: freshVaultSnapshot.previewDepositShares,
+                depositSlippageBps: parseBps(depositSlippageBps),
+                authorizationDeadline,
+                autoRevoke,
+              })
+              const solvedDepositSizing = depositStrategy.solvedSizing
+              const walletAssetsValue = solvedDepositSizing.walletAssets
+              const totalDepositAssets = solvedDepositSizing.totalDepositAssets
+              const flashAssetsValue = solvedDepositSizing.flashAssets
+              const targetBorrowAssetsValue = solvedDepositSizing.targetBorrowAssets
               if (walletAssetsValue > freshBaseSnapshot.walletLoanTokenBalance) {
                 throw new Error('Wallet assets exceed the connected wallet balance.')
               }
               if (walletAssetsValue > freshBaseSnapshot.walletLoanTokenAllowanceToAdapter) {
                 throw new Error('Wallet assets exceed the current GeneralAdapter1 allowance.')
               }
-              const maxVaultSharePriceE27 = computeMaxSharePriceE27({
-                assets: totalDepositAssets,
-                previewShares: freshVaultSnapshot.previewDepositShares,
-                slippageBps: parseBps(depositSlippageBps),
-              })
-              return buildMorphoBundlerDepositPlan({
-                chainId,
-                account: assertAddress(account),
-                marketParams,
-                vault: assertAddress(vaultAddress),
-                morphoLiquidityAssets: freshBaseSnapshot.maxFlashLoanAssets,
-                walletAssets: walletAssetsValue,
-                flashAssets: flashAssetsValue,
-                targetBorrowAssets: targetBorrowAssetsValue,
-                maxVaultSharePriceE27,
-                borrowSlippageBps: parseBps(depositSlippageBps),
-                authorizationNonce: freshBaseSnapshot.morphoNonce,
-                authorizationDeadline,
-                autoRevoke,
-                skipInitialAuthorization: freshBaseSnapshot.isBundlerAuthorized,
-                accrualPosition: freshBaseSnapshot.accrualPosition,
-                previewDepositShares: freshVaultSnapshot.previewDepositShares,
-              })
+              if (!depositStrategy.solvedPlan.summary.completed) {
+                throw new Error(depositStrategy.solvedPlan.summary.message || 'The deposit builder could not reach the requested target.')
+              }
+              return depositStrategy.solvedPlan
             })()
 
       if (builderMode === 'deposit' && 'summary' in plan && !plan.summary.completed) {
@@ -1559,28 +1556,28 @@ export function BundlerApp() {
     )
   }
 
-  async function buildFreshDepositPlan(parameters: {
-    walletAssetsValue: bigint
-    flashAssetsValue: bigint
-    targetBorrowAssetsValue: bigint
-    authorizationDeadline?: bigint
-  }) {
-    if (!selectedProvider || !baseSnapshot || !account) {
-      throw new Error('Connect a wallet and refresh the snapshot before building the leverage plan.')
-    }
+async function buildFreshDepositPlan(parameters: {
+  walletAssetsValue: bigint
+  flashAssetsValue: bigint
+  targetDepositAssetsValue: bigint
+  targetBorrowAssetsValue: bigint
+  authorizationDeadline?: bigint
+}) {
+  if (!selectedProvider || !baseSnapshot || !account) {
+    throw new Error('Connect a wallet and refresh the snapshot before building the leverage plan.')
+  }
 
-    const totalDepositAssets = parameters.walletAssetsValue + parameters.flashAssetsValue
-    if (totalDepositAssets <= 0n) {
-      throw new Error('Wallet assets plus flash assets must be greater than zero.')
-    }
+  if (parameters.targetDepositAssetsValue <= 0n) {
+    throw new Error('Target deposit assets must be greater than zero.')
+  }
 
-    const vault = assertAddress(vaultAddress)
-    const vaultPreview = await fetchVaultSnapshot({
-      provider: selectedProvider.provider,
-      vault,
-      shares: 0n,
-      assets: totalDepositAssets,
-    })
+  const vault = assertAddress(vaultAddress)
+  const vaultPreview = await fetchVaultSnapshot({
+    provider: selectedProvider.provider,
+    vault,
+    shares: 0n,
+    assets: parameters.targetDepositAssetsValue,
+  })
 
     if (!vaultPreview.asset || vaultPreview.asset.toLowerCase() !== baseSnapshot.marketParams.loanToken.toLowerCase()) {
       throw new Error('The ERC-4626 vault asset must match the Morpho loan token for this builder.')
@@ -1593,6 +1590,7 @@ export function BundlerApp() {
       vault,
       walletAssetsValue: parameters.walletAssetsValue,
       flashAssetsValue: parameters.flashAssetsValue,
+      targetDepositAssetsValue: parameters.targetDepositAssetsValue,
       targetBorrowAssetsValue: parameters.targetBorrowAssetsValue,
       previewDepositShares: vaultPreview.previewDepositShares,
       depositSlippageBps: parseBps(depositSlippageBps),
@@ -1651,6 +1649,7 @@ export function BundlerApp() {
               vault,
               walletAssetsValue: parameters.walletAssetsValue,
               flashAssetsValue: riskSearch.flashAssetsValue,
+              targetDepositAssetsValue: parameters.walletAssetsValue + riskSearch.flashAssetsValue,
               targetBorrowAssetsValue,
               previewDepositShares: riskSearch.previewDepositShares,
               depositSlippageBps: parseBps(depositSlippageBps),
@@ -1691,6 +1690,7 @@ export function BundlerApp() {
       const { plan, vaultPreview } = await buildFreshDepositPlan({
         walletAssetsValue: parameters.walletAssetsValue,
         flashAssetsValue,
+        targetDepositAssetsValue: parameters.walletAssetsValue + flashAssetsValue,
         targetBorrowAssetsValue: minimumTargetBorrowAssets,
       })
 
@@ -1734,6 +1734,7 @@ export function BundlerApp() {
               vault,
               walletAssetsValue: parameters.walletAssetsValue,
               flashAssetsValue: pointBuild.flashAssetsValue,
+              targetDepositAssetsValue: parameters.walletAssetsValue + pointBuild.flashAssetsValue,
               targetBorrowAssetsValue: pointBuild.targetBorrowAssetsValue,
               previewDepositShares: pointBuild.previewDepositShares,
               depositSlippageBps: parseBps(depositSlippageBps),
@@ -1804,6 +1805,7 @@ export function BundlerApp() {
       const candidate = await buildFreshDepositPlan({
         walletAssetsValue: parameters.walletAssetsValue,
         flashAssetsValue: mid,
+        targetDepositAssetsValue: parameters.walletAssetsValue + mid,
         targetBorrowAssetsValue: minimumTargetBorrowAssets,
       })
 
@@ -1860,20 +1862,20 @@ export function BundlerApp() {
     if (!baseSnapshot) return
 
     const nextValue = formatUnits(baseSnapshot.maxFlashLoanAssets, baseSnapshot.loanTokenDecimals)
-    setFlashAssets(nextValue)
+    setDepositFlashLoanAssets(nextValue)
     setStatus({
       tone: 'success',
-      text: `Filled Flash assets with Morpho's current max flash-loan liquidity: ${nextValue} ${baseSnapshot.loanTokenSymbol}.`,
+      text: `Filled Flash loan size with Morpho's current max flash-loan liquidity: ${nextValue} ${baseSnapshot.loanTokenSymbol}.`,
     })
   }
 
   function applyWalletBalance() {
     if (!baseSnapshot) return
     const nextValue = formatUnits(baseSnapshot.walletLoanTokenBalance, baseSnapshot.loanTokenDecimals)
-    setWalletAssets(nextValue)
+    setDepositWalletAssets(nextValue)
     setStatus({
       tone: 'success',
-      text: `Filled Wallet assets in with the connected wallet balance: ${nextValue} ${baseSnapshot.loanTokenSymbol}.`,
+      text: `Filled Wallet token usage with the connected wallet balance: ${nextValue} ${baseSnapshot.loanTokenSymbol}.`,
     })
   }
 
@@ -1884,7 +1886,7 @@ export function BundlerApp() {
     }
 
     try {
-      const amount = parseUnits(walletAssets || '0', baseSnapshot.loanTokenDecimals)
+      const amount = resolvedDepositSizing.result?.walletAssets ?? 0n
       if (amount <= 0n) {
         throw new Error('Wallet assets must be greater than zero before approving.')
       }
@@ -1924,27 +1926,6 @@ export function BundlerApp() {
         tone: 'error',
         text: error instanceof Error ? error.message : 'Failed to submit the ERC20 approval.',
       })
-    }
-  }
-
-  function applyTargetUtilizationAfter(value: string) {
-    setTargetUtilizationAfter(value)
-
-    const trimmed = value.trim()
-    if (!trimmed || depositAutoLeveragePoints.length === 0) return
-
-    try {
-      const targetUtilizationAfterValue = parseOptionalPercentWad(trimmed, 'Target utilization after')
-      if (targetUtilizationAfterValue == null) return
-
-      setDepositAutoLeverageIndex(
-        findDepositAutoLeverageIndexForUtilization({
-          points: depositAutoLeveragePoints,
-          targetUtilizationAfter: targetUtilizationAfterValue,
-        }),
-      )
-    } catch {
-      // Keep the user's in-progress text while leaving the current feasible point unchanged.
     }
   }
 
@@ -2186,6 +2167,7 @@ export function BundlerApp() {
               <Stat label="Utilization" value={baseSnapshot ? formatWadPercent(baseSnapshot.market.utilization) : '—'} />
               <Stat label="Full repay est." value={baseSnapshot ? `${formatUnits(baseSnapshot.estimatedFullRepayAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}` : '—'} />
               <Stat label="Max flash loan" value={baseSnapshot ? `${formatUnits(baseSnapshot.maxFlashLoanAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}` : '—'} />
+              <Stat label="Market borrow liquidity" value={baseSnapshot ? `${formatUnits(baseSnapshot.marketBorrowLiquidityAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}` : '—'} />
               <Stat label="Morpho nonce" value={baseSnapshot ? baseSnapshot.morphoNonce.toString() : '—'} monospace />
               <Stat label="Wallet loan bal." value={baseSnapshot ? `${formatUnits(baseSnapshot.walletLoanTokenBalance, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}` : '—'} />
               <Stat label="Adapter allowance" value={baseSnapshot ? `${formatUnits(baseSnapshot.walletLoanTokenAllowanceToAdapter, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}` : '—'} />
@@ -2336,86 +2318,95 @@ export function BundlerApp() {
             ) : (
               /* ── DEPOSIT MODE ── */
               <div className="two-col">
-                <TextField label="Wallet assets in" value={walletAssets} onChange={setWalletAssets} />
+                <TextField label="Final deposit amount" value={depositFinalAmount} onChange={setDepositFinalAmount} />
+                <TextField label="Final borrow amount" value={depositFinalBorrowAmount} onChange={setDepositFinalBorrowAmount} />
+                <TextField label="Wallet token usage (helper)" value={depositWalletAssets} onChange={setDepositWalletAssets} />
+                <TextField label="Flash loan size (helper)" value={depositFlashLoanAssets} onChange={setDepositFlashLoanAssets} />
                 <TextField label="Deposit slippage (bps)" value={depositSlippageBps} onChange={setDepositSlippageBps} />
                 <TextField label="Max LTV after (%)" value={maxLtvAfter} onChange={setMaxLtvAfter} />
                 <TextField label="Min health after (x)" value={minHealthAfter} onChange={setMinHealthAfter} />
-                <TextField label="Target utilization after (%)" value={targetUtilizationAfter} onChange={applyTargetUtilizationAfter} />
 
-                <div className="field field--span-2">
-                  <span>Utilization after</span>
-                  <div className="leverage-slider">
-                    <div className="leverage-slider__header">
-                      <div>
-                        <div className="leverage-slider__label">Auto leverage</div>
-                        <div className="leverage-slider__value">
-                          {activeDepositAutoLeveragePoint
-                            ? formatWadPercent(activeDepositAutoLeveragePoint.utilizationAfter)
-                            : 'Not ready'}
-                        </div>
-                      </div>
-                      <span className="pill pill--soft">
-                        {depositAutoLeverageLoading
-                          ? 'Computing path'
-                          : depositAutoLeveragePoints.length > 0
-                            ? `${depositAutoLeveragePoints.length} feasible steps`
-                            : 'Unavailable'}
-                      </span>
-                    </div>
+                <div className="wallet-grid field--span-2">
+                  <Stat
+                    label="Solved wallet use"
+                    value={activeDepositSizing && baseSnapshot
+                      ? `${formatUnits(activeDepositSizing.walletAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                      : '—'}
+                  />
+                  <Stat
+                    label="Solved flash loan"
+                    value={activeDepositSizing && baseSnapshot
+                      ? `${formatUnits(activeDepositSizing.flashAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                      : '—'}
+                  />
+                  <Stat
+                    label="Solved final borrow"
+                    value={activeDepositSizing && baseSnapshot
+                      ? `${formatUnits(activeDepositSizing.targetBorrowAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                      : '—'}
+                  />
+                  <Stat
+                    label="Solved final deposit"
+                    value={activeDepositSizing && baseSnapshot
+                      ? `${formatUnits(activeDepositSizing.totalDepositAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                      : '—'}
+                  />
+                </div>
 
-                    <div className="leverage-slider__range-wrap">
-                      <div className="leverage-slider__track">
-                        <div className="leverage-slider__track-fill" style={{ width: `${depositAutoLeverageProgress}%` }} />
-                      </div>
-                      <input
-                        className="leverage-slider__range"
-                        type="range"
-                        min={0}
-                        max={Math.max(depositAutoLeveragePoints.length - 1, 0)}
-                        step={1}
-                        value={clampNumber(depositAutoLeverageIndex, 0, Math.max(depositAutoLeveragePoints.length - 1, 0))}
-                        onChange={(event) => setDepositAutoLeverageIndex(Number(event.target.value))}
-                        disabled={depositAutoLeverageLoading || depositAutoLeveragePoints.length <= 1}
-                      />
-                    </div>
-
-                    <div className="leverage-slider__legend">
-                      <span>{`Current ${baseSnapshot ? formatWadPercent(baseSnapshot.market.utilization) : 'N/A'}`}</span>
-                      <span>
-                        {depositAutoLeverageMaxPoint
-                          ? `Max ${formatWadPercent(depositAutoLeverageMaxPoint.utilizationAfter)}`
-                          : 'Max N/A'}
-                      </span>
-                    </div>
-
-                    <div className="leverage-slider__stats">
-                      <Stat
-                        label="Flash assets"
-                        value={activeDepositAutoLeveragePoint && baseSnapshot
-                          ? `${formatUnits(activeDepositAutoLeveragePoint.flashAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
-                          : '—'}
-                      />
-                      <Stat
-                        label="Target borrow after"
-                        value={activeDepositAutoLeveragePoint && baseSnapshot
-                          ? `${formatUnits(activeDepositAutoLeveragePoint.targetBorrowAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
-                          : '—'}
-                      />
-                      <Stat
-                        label="Vault deposit"
-                        value={activeDepositAutoLeveragePoint && baseSnapshot
-                          ? `${formatUnits(activeDepositAutoLeveragePoint.totalDepositAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
-                          : '—'}
-                      />
-                    </div>
-                  </div>
+                <div className="wallet-grid field--span-2">
+                  <Stat
+                    label="Max final borrow @ current flash"
+                    value={depositConstraintPreview.result && baseSnapshot
+                      ? `${formatUnits(depositConstraintPreview.result.maxTargetBorrowAssetsAtCurrentFlash, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                      : '—'}
+                  />
+                  <Stat
+                    label="Max flash @ current target"
+                    value={depositConstraintPreview.result && baseSnapshot
+                      ? `${formatUnits(depositConstraintPreview.result.maxFlashAssetsAtCurrentTarget, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                      : '—'}
+                  />
+                  <Stat
+                    label="Safe borrow cap after deposit"
+                    value={depositConstraintPreview.result && baseSnapshot
+                      ? `${formatUnits(depositConstraintPreview.result.maxSafeBorrowAfterInitialDeposit, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                      : '—'}
+                  />
+                  <Stat
+                    label="Market borrow liquidity"
+                    value={depositConstraintPreview.result && baseSnapshot
+                      ? `${formatUnits(depositConstraintPreview.result.marketBorrowLiquidityAssets, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                      : '—'}
+                  />
+                  <Stat
+                    label="Callback borrow liquidity after flash"
+                    value={depositConstraintPreview.result && baseSnapshot
+                      ? `${formatUnits(depositConstraintPreview.result.callbackBorrowLiquidityAfterFlash, baseSnapshot.loanTokenDecimals)} ${baseSnapshot.loanTokenSymbol}`
+                      : '—'}
+                  />
                 </div>
 
                 <div className="actions field--span-2">
-                  <button className="ghost-button" onClick={() => setDepositAutoLeverageIndex(0)} type="button" disabled={depositAutoLeverageLoading || depositAutoLeveragePoints.length === 0}>Current point</button>
-                  <button className="ghost-button" onClick={() => setDepositAutoLeverageIndex(Math.max(depositAutoLeveragePoints.length - 1, 0))} type="button" disabled={depositAutoLeverageLoading || depositAutoLeveragePoints.length <= 1}>Max leverage</button>
+                  <button
+                    className="ghost-button"
+                    onClick={() => {
+                      setDepositWalletAssets('')
+                      setDepositFlashLoanAssets('')
+                    }}
+                    type="button"
+                  >
+                    Auto size helpers
+                  </button>
                   <button className="ghost-button" onClick={applyWalletBalance} type="button" disabled={!baseSnapshot}>Use wallet balance</button>
-                  <button className="ghost-button" onClick={approveLoanToken} type="button" disabled={!baseSnapshot || !walletAssets.trim() || walletAssets.trim() === '0'}>Approve exact amount</button>
+                  <button className="ghost-button" onClick={applyMaxFlashLoan} type="button" disabled={!baseSnapshot}>Max flash loan</button>
+                  <button
+                    className="ghost-button"
+                    onClick={approveLoanToken}
+                    type="button"
+                    disabled={!baseSnapshot || (resolvedDepositSizing.result?.walletAssets ?? 0n) <= 0n}
+                  >
+                    Approve exact amount
+                  </button>
                 </div>
 
                 <TextField label="Auth deadline (min)" value={authorizationDeadlineMinutes} onChange={setAuthorizationDeadlineMinutes} />
@@ -2427,12 +2418,34 @@ export function BundlerApp() {
                   </label>
                 </label>
 
-                {depositAutoLeverageError ? <div className="warning field--span-2">{depositAutoLeverageError}</div> : null}
+                {resolvedDepositSizing.error ? <div className="warning field--span-2">{resolvedDepositSizing.error}</div> : null}
+                {resolvedDepositStrategy.error ? <div className="warning field--span-2">{resolvedDepositStrategy.error}</div> : null}
+                {depositConstraintPreview.error ? <div className="warning field--span-2">{depositConstraintPreview.error}</div> : null}
+                {activeDepositStrategy?.autoAdjustedFlashAssets && activeDepositStrategy.autoAdjustmentMessage ? (
+                  <div className="warning field--span-2">{activeDepositStrategy.autoAdjustmentMessage}</div>
+                ) : null}
+                {depositConstraintPreview.result && resolvedDepositSizing.result && !activeDepositStrategy?.autoAdjustedFlashAssets && resolvedDepositSizing.result.targetBorrowAssets > depositConstraintPreview.result.maxTargetBorrowAssetsAtCurrentFlash ? (
+                  <div className="warning field--span-2">
+                    {`Current final borrow target exceeds the current flash-size limit. Max allowed final borrow at this flash size is ${formatUnits(
+                      depositConstraintPreview.result.maxTargetBorrowAssetsAtCurrentFlash,
+                      baseSnapshot!.loanTokenDecimals,
+                    )} ${baseSnapshot!.loanTokenSymbol}.`}
+                  </div>
+                ) : null}
+                {depositConstraintPreview.result && resolvedDepositSizing.result && !activeDepositStrategy?.autoAdjustedFlashAssets && resolvedDepositSizing.result.flashAssets > depositConstraintPreview.result.maxFlashAssetsAtCurrentTarget ? (
+                  <div className="warning field--span-2">
+                    {`Current flash size exceeds the current borrow-target limit. Max allowed flash at this target is ${formatUnits(
+                      depositConstraintPreview.result.maxFlashAssetsAtCurrentTarget,
+                      baseSnapshot!.loanTokenDecimals,
+                    )} ${baseSnapshot!.loanTokenSymbol}.`}
+                  </div>
+                ) : null}
 
                 <div className="note field--span-2">
                   <p><strong>Callback sequence.</strong> Optionally pull loan tokens from wallet, flash-loan, deposit into ERC-4626 vault, supply vault shares as Morpho collateral, borrow against collateral, sweep remainder back to wallet, optionally revoke authorization.</p>
-                  <p><strong>Slider.</strong> Keeps <em>Wallet assets in</em> fixed and grows flash + borrow along the feasible leverage path. Drag or type a target utilization. Max LTV after / Min health after constraints limit the upper end of the slider.</p>
-                  <p><strong>Allowance.</strong> Deposit mode needs an ERC20 approval on the loan token for <code>GeneralAdapter1</code> when <em>Wallet assets in</em> &gt; 0.</p>
+                  <p><strong>Inputs.</strong> <em>Final deposit amount</em> and <em>Final borrow amount</em> are the primary targets. Leave the wallet / flash helper fields blank to let the app size them automatically.</p>
+                  <p><strong>Loop fallback.</strong> If the requested flash helper is too large for callback borrowing, the solver automatically shrinks flash and switches to repeated deposit → supply collateral → borrow loop legs until the final targets are reached.</p>
+                  <p><strong>Allowance.</strong> Deposit mode needs an ERC20 approval on the loan token for <code>GeneralAdapter1</code> when the solved wallet usage is greater than zero.</p>
                 </div>
               </div>
             )}
@@ -2447,14 +2460,15 @@ export function BundlerApp() {
 
             {builderMode === 'deposit' ? (
               <div className="wallet-grid">
-                <Stat label="Wallet assets in" value={depositPreview ? `${formatUnits(depositPreview.walletAssetsIn, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
-                <Stat label="Flash used" value={depositPreview ? `${formatUnits(depositPreview.flashAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
-                <Stat label="Target borrow after" value={depositPreview ? `${formatUnits(depositPreview.targetBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
-                <Stat label="Vault deposit" value={depositPreview ? `${formatUnits(depositPreview.totalDepositAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Wallet used" value={depositPreview ? `${formatUnits(depositPreview.walletAssetsIn, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Flash loan" value={depositPreview ? `${formatUnits(depositPreview.flashAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Loop legs" value={depositPreview ? String(depositPreview.iterationCount) : '—'} />
+                <Stat label="Final borrow target" value={depositPreview ? `${formatUnits(depositPreview.targetBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Final deposit" value={depositPreview ? `${formatUnits(depositPreview.totalDepositAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
                 <Stat label="Preview deposit shares" value={depositPreview ? `${formatUnits(depositPreview.previewDepositShares, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim() : '—'} />
                 <Stat label="Added borrow" value={depositPreview ? `${formatUnits(depositPreview.additionalBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
                 <Stat label="Final borrow" value={depositPreview ? `${formatUnits(depositPreview.finalBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
-                <Stat label="Liquid out after flash" value={depositPreview ? `${formatUnits(depositPreview.netLoanTokenOut, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                <Stat label="Net wallet out" value={depositPreview ? `${formatUnits(depositPreview.netLoanTokenOut, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
                 <Stat label="Borrow after" value={depositPreview ? `${formatUnits(depositPreview.finalPosition.borrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
                 <Stat label="Collateral after" value={depositPreview ? `${formatUnits(depositPreview.finalPosition.collateral, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim() : '—'} />
                 <Stat label="LTV after" value={depositPreview ? formatWadPercent(depositPreview.finalPosition.ltv) : '—'} />
@@ -2478,6 +2492,16 @@ export function BundlerApp() {
             )}
             {redeemPreview?.withdrawError ? <div className="warning">{redeemPreview.withdrawError}</div> : null}
             {depositPreview?.message ? <div className="warning">{depositPreview.message}</div> : null}
+            {depositPreview?.loopEnabled ? (
+              <div className="note" style={{ marginTop: 16 }}>
+                <p><strong>Loop process.</strong> The builder could not satisfy the target with a single deposit, supply, and borrow leg, so it switched to repeated deposit, supply collateral, and borrow legs inside the same flash-loan callback.</p>
+                {depositPreview.iterations.map((iteration) => (
+                  <p key={iteration.index}>
+                    {`Leg ${iteration.index + 1}: deposit ${formatUnits(iteration.depositAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}, borrow ${formatUnits(iteration.borrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}, callback balance after leg ${formatUnits(iteration.loanTokenBalanceAfter, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}.`}
+                  </p>
+                ))}
+              </div>
+            ) : null}
           </section>
 
           {/* ── Preview & Send ── */}
@@ -2493,11 +2517,11 @@ export function BundlerApp() {
             <div className="wallet-grid">
               {builderMode === 'deposit' ? (
                 <>
-                  <Stat label="Vault deposit" value={previewAmount != null ? `${formatUnits(previewAmount, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                  <Stat label="Final deposit" value={previewAmount != null ? `${formatUnits(previewAmount, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
                   <Stat label="Preview deposit shares" value={previewShares != null ? `${formatUnits(previewShares, Number(collateralTokenDecimals))} ${baseSnapshot?.collateralTokenSymbol || ''}`.trim() : '—'} />
-                  <Stat label="Target borrow after" value={draft.targetBorrowAssets != null ? `${formatUnits(draft.targetBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                  <Stat label="Final borrow target" value={draft.targetBorrowAssets != null ? `${formatUnits(draft.targetBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
                   <Stat label="Estimated added borrow" value={previewExpectedBorrowAssets != null ? `${formatUnits(previewExpectedBorrowAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
-                  <Stat label="Liquid out after flash" value={previewEstimatedNetAssets != null ? `${formatUnits(previewEstimatedNetAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
+                  <Stat label="Net wallet out" value={previewEstimatedNetAssets != null ? `${formatUnits(previewEstimatedNetAssets, Number(loanTokenDecimals))} ${baseSnapshot?.loanTokenSymbol || ''}`.trim() : '—'} />
                 </>
               ) : (
                 <>
@@ -2612,6 +2636,7 @@ async function fetchBaseSnapshot(parameters: {
     loanTokenDecimals: loanTokenInfo.decimals ?? 18,
     collateralTokenDecimals: collateralTokenInfo.decimals ?? 18,
     maxFlashLoanAssets,
+    marketBorrowLiquidityAssets: market.liquidity,
     walletLoanTokenBalance,
     walletLoanTokenAllowanceToAdapter,
   }
@@ -2701,6 +2726,7 @@ function buildDepositPlanWithPreview(parameters: {
   vault: Address
   walletAssetsValue: bigint
   flashAssetsValue: bigint
+  targetDepositAssetsValue: bigint
   targetBorrowAssetsValue: bigint
   previewDepositShares: bigint
   depositSlippageBps: bigint
@@ -2708,7 +2734,7 @@ function buildDepositPlanWithPreview(parameters: {
   autoRevoke: boolean
 }) {
   const maxVaultSharePriceE27 = computeMaxSharePriceE27({
-    assets: parameters.walletAssetsValue + parameters.flashAssetsValue,
+    assets: parameters.targetDepositAssetsValue,
     previewShares: parameters.previewDepositShares,
     slippageBps: parameters.depositSlippageBps,
   })
@@ -2718,9 +2744,11 @@ function buildDepositPlanWithPreview(parameters: {
     account: parameters.account,
     marketParams: parameters.snapshot.marketParams,
     vault: parameters.vault,
-    morphoLiquidityAssets: parameters.snapshot.maxFlashLoanAssets,
+    flashLoanLiquidityAssets: parameters.snapshot.maxFlashLoanAssets,
+    marketBorrowLiquidityAssets: parameters.snapshot.marketBorrowLiquidityAssets,
     walletAssets: parameters.walletAssetsValue,
     flashAssets: parameters.flashAssetsValue,
+    targetDepositAssets: parameters.targetDepositAssetsValue,
     targetBorrowAssets: parameters.targetBorrowAssetsValue,
     maxVaultSharePriceE27,
     borrowSlippageBps: parameters.depositSlippageBps,
@@ -2731,6 +2759,207 @@ function buildDepositPlanWithPreview(parameters: {
     accrualPosition: parameters.snapshot.accrualPosition,
     previewDepositShares: parameters.previewDepositShares,
   })
+}
+
+function findAdjustedDepositFlashPlan(parameters: {
+  chainId: number
+  account: Address
+  snapshot: BaseSnapshot
+  vault: Address
+  requestedSizing: ResolvedDepositSizing
+  previewDepositShares: bigint
+  depositSlippageBps: bigint
+  authorizationDeadline: bigint
+  autoRevoke: boolean
+}): {
+  flashAssets: bigint
+  plan: Awaited<ReturnType<typeof buildMorphoBundlerDepositPlan>>
+} | null {
+  if (parameters.requestedSizing.flashAssets <= 0n) {
+    return null
+  }
+
+  const additionalBorrowTarget =
+    parameters.requestedSizing.targetBorrowAssets > parameters.snapshot.borrowAssets
+      ? parameters.requestedSizing.targetBorrowAssets - parameters.snapshot.borrowAssets
+      : 0n
+
+  let searchUpper = parameters.requestedSizing.flashAssets
+  if (searchUpper > parameters.snapshot.maxFlashLoanAssets) {
+    searchUpper = parameters.snapshot.maxFlashLoanAssets
+  }
+  if (searchUpper > parameters.requestedSizing.totalDepositAssets) {
+    searchUpper = parameters.requestedSizing.totalDepositAssets
+  }
+  if (searchUpper > additionalBorrowTarget) {
+    searchUpper = additionalBorrowTarget
+  }
+  if (searchUpper <= 0n) {
+    return null
+  }
+
+  const minimumFlashSample = parameters.requestedSizing.walletAssets > 0n ? 0n : 1n
+  if (searchUpper < minimumFlashSample) {
+    return null
+  }
+
+  const evaluateFlashAssets = (flashAssets: bigint) =>
+    buildDepositPlanWithPreview({
+      chainId: parameters.chainId,
+      account: parameters.account,
+      snapshot: parameters.snapshot,
+      vault: parameters.vault,
+      walletAssetsValue: parameters.requestedSizing.walletAssets,
+      flashAssetsValue: flashAssets,
+      targetDepositAssetsValue: parameters.requestedSizing.totalDepositAssets,
+      targetBorrowAssetsValue: parameters.requestedSizing.targetBorrowAssets,
+      previewDepositShares: parameters.previewDepositShares,
+      depositSlippageBps: parameters.depositSlippageBps,
+      authorizationDeadline: parameters.authorizationDeadline,
+      autoRevoke: parameters.autoRevoke,
+    })
+
+  const sampleCount = 24n
+  const samples = new Set<string>([minimumFlashSample.toString(), searchUpper.toString()])
+  for (let index = 1n; index < sampleCount; index += 1n) {
+    samples.add(((searchUpper * index) / sampleCount).toString())
+  }
+
+  const evaluations = [...samples]
+    .map((value) => BigInt(value))
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+    .map((flashAssets) => ({
+      flashAssets,
+      plan: evaluateFlashAssets(flashAssets),
+    }))
+
+  let bestFeasible: { flashAssets: bigint; plan: Awaited<ReturnType<typeof buildMorphoBundlerDepositPlan>> } | null = null
+  let firstInfeasibleAbove: bigint | null = null
+
+  for (const evaluation of evaluations) {
+    if (evaluation.plan.summary.completed) {
+      bestFeasible = evaluation
+      continue
+    }
+    if (bestFeasible && evaluation.flashAssets > bestFeasible.flashAssets) {
+      firstInfeasibleAbove = evaluation.flashAssets
+      break
+    }
+  }
+
+  if (!bestFeasible) {
+    return null
+  }
+
+  if (firstInfeasibleAbove == null || firstInfeasibleAbove <= bestFeasible.flashAssets) {
+    return bestFeasible
+  }
+
+  let low = bestFeasible.flashAssets
+  let high = firstInfeasibleAbove
+
+  for (let index = 0; index < 24 && low + 1n < high; index += 1) {
+    const mid = low + (high - low) / 2n
+    const candidatePlan = evaluateFlashAssets(mid)
+    if (candidatePlan.summary.completed) {
+      bestFeasible = {
+        flashAssets: mid,
+        plan: candidatePlan,
+      }
+      low = mid
+    } else {
+      high = mid
+    }
+  }
+
+  return bestFeasible
+}
+
+function resolveDepositStrategy(parameters: {
+  chainId: number
+  account: Address
+  snapshot: BaseSnapshot
+  vault: Address
+  requestedSizing: ResolvedDepositSizing
+  previewDepositShares: bigint
+  depositSlippageBps: bigint
+  authorizationDeadline: bigint
+  autoRevoke: boolean
+}): ResolvedDepositStrategy {
+  let requestedPlan: Awaited<ReturnType<typeof buildMorphoBundlerDepositPlan>> | null = null
+  let requestedPlanError = ''
+
+  try {
+    requestedPlan = buildDepositPlanWithPreview({
+      chainId: parameters.chainId,
+      account: parameters.account,
+      snapshot: parameters.snapshot,
+      vault: parameters.vault,
+      walletAssetsValue: parameters.requestedSizing.walletAssets,
+      flashAssetsValue: parameters.requestedSizing.flashAssets,
+      targetDepositAssetsValue: parameters.requestedSizing.totalDepositAssets,
+      targetBorrowAssetsValue: parameters.requestedSizing.targetBorrowAssets,
+      previewDepositShares: parameters.previewDepositShares,
+      depositSlippageBps: parameters.depositSlippageBps,
+      authorizationDeadline: parameters.authorizationDeadline,
+      autoRevoke: parameters.autoRevoke,
+    })
+  } catch (error) {
+    requestedPlanError = error instanceof Error ? error.message : 'Failed to build the requested leverage path.'
+  }
+
+  if (requestedPlan?.summary.completed) {
+    return {
+      requestedSizing: parameters.requestedSizing,
+      solvedSizing: parameters.requestedSizing,
+      requestedPlan,
+      solvedPlan: requestedPlan,
+      autoAdjustedFlashAssets: false,
+    }
+  }
+
+  const adjustedFlashPlan = findAdjustedDepositFlashPlan(parameters)
+  if (!adjustedFlashPlan) {
+    if (!requestedPlan) {
+      throw new Error(requestedPlanError || 'The deposit builder could not reach the requested target.')
+    }
+
+    return {
+      requestedSizing: parameters.requestedSizing,
+      solvedSizing: parameters.requestedSizing,
+      requestedPlan,
+      solvedPlan: requestedPlan,
+      autoAdjustedFlashAssets: false,
+    }
+  }
+
+  const solvedSizing: ResolvedDepositSizing = {
+    ...parameters.requestedSizing,
+    flashAssets: adjustedFlashPlan.flashAssets,
+  }
+
+    return {
+      requestedSizing: parameters.requestedSizing,
+      solvedSizing,
+      requestedPlan: requestedPlan ?? adjustedFlashPlan.plan,
+      solvedPlan: adjustedFlashPlan.plan,
+      autoAdjustedFlashAssets: adjustedFlashPlan.flashAssets !== parameters.requestedSizing.flashAssets,
+      autoAdjustmentMessage:
+        adjustedFlashPlan.flashAssets !== parameters.requestedSizing.flashAssets
+        ? requestedPlan
+          ? `Requested flash helper ${formatUnits(parameters.requestedSizing.flashAssets, parameters.snapshot.loanTokenDecimals)} ${parameters.snapshot.loanTokenSymbol} would leave only ${formatUnits(
+              requestedPlan.summary.callbackBorrowLiquidityAfterFlash,
+              parameters.snapshot.loanTokenDecimals,
+            )} ${parameters.snapshot.loanTokenSymbol} of callback borrow liquidity. Solver reduced flash to ${formatUnits(
+              adjustedFlashPlan.flashAssets,
+              parameters.snapshot.loanTokenDecimals,
+            )} ${parameters.snapshot.loanTokenSymbol} and will use ${adjustedFlashPlan.plan.summary.iterationCount} loop leg(s) to reach the requested final deposit and final borrow.`
+          : `Requested flash helper ${formatUnits(parameters.requestedSizing.flashAssets, parameters.snapshot.loanTokenDecimals)} ${parameters.snapshot.loanTokenSymbol} exceeds the current executable range. Solver reduced flash to ${formatUnits(
+              adjustedFlashPlan.flashAssets,
+              parameters.snapshot.loanTokenDecimals,
+            )} ${parameters.snapshot.loanTokenSymbol} and will use ${adjustedFlashPlan.plan.summary.iterationCount} loop leg(s) to reach the requested final deposit and final borrow.`
+        : undefined,
+  }
 }
 
 
@@ -2913,14 +3142,170 @@ function readWithdrawShares(parameters: {
   return parseUnits(parameters.withdrawCollateralAssets, Number(parameters.collateralTokenDecimals))
 }
 
-function readDepositAssets(parameters: {
+function parseOptionalTokenAmount(parameters: {
+  value: string
+  label: string
+  decimals: number
+}) {
+  const trimmed = parameters.value.trim()
+  if (!trimmed) return undefined
+
+  const parsed = parseUnits(trimmed, parameters.decimals)
+  if (parsed < 0n) {
+    throw new Error(`${parameters.label} must be greater than or equal to zero.`)
+  }
+  return parsed
+}
+
+function resolveDepositSizing(parameters: {
   walletAssets: string
   flashAssets: string
-  loanTokenDecimals: string
+  totalDepositAssets: string
+  finalBorrowAssets: string
+  snapshot: Pick<
+    BaseSnapshot,
+    | 'borrowAssets'
+    | 'loanTokenDecimals'
+    | 'loanTokenSymbol'
+    | 'maxFlashLoanAssets'
+    | 'walletLoanTokenAllowanceToAdapter'
+    | 'walletLoanTokenBalance'
+  >
+  loanTokenDecimals: string | number
 }) {
-  const walletAssets = parameters.walletAssets.trim() ? parseUnits(parameters.walletAssets, Number(parameters.loanTokenDecimals)) : 0n
-  const flashAssets = parameters.flashAssets.trim() ? parseUnits(parameters.flashAssets, Number(parameters.loanTokenDecimals)) : 0n
-  return walletAssets + flashAssets
+  const decimals = Number(parameters.loanTokenDecimals)
+  const walletAssetsInput = parseOptionalTokenAmount({
+    value: parameters.walletAssets,
+    label: 'Wallet token usage',
+    decimals,
+  })
+  const flashAssetsInput = parseOptionalTokenAmount({
+    value: parameters.flashAssets,
+    label: 'Flash loan size',
+    decimals,
+  })
+  const totalDepositAssetsInput = parseOptionalTokenAmount({
+    value: parameters.totalDepositAssets,
+    label: 'Final deposit amount',
+    decimals,
+  })
+  const finalBorrowAssetsInput =
+    parseOptionalTokenAmount({
+      value: parameters.finalBorrowAssets,
+      label: 'Final borrow amount',
+      decimals,
+    })
+
+  let totalDepositAssets = totalDepositAssetsInput
+  let autoDerivedTotalDepositAssets = false
+  if (totalDepositAssets == null) {
+    if (walletAssetsInput == null && flashAssetsInput == null) {
+      throw new Error('Set Final deposit amount, or provide Wallet token usage / Flash loan size so the deposit size can be derived.')
+    }
+    totalDepositAssets = (walletAssetsInput ?? 0n) + (flashAssetsInput ?? 0n)
+    autoDerivedTotalDepositAssets = true
+  }
+  if (totalDepositAssets <= 0n) {
+    throw new Error('Final deposit amount must be greater than zero.')
+  }
+
+  let walletAssets = walletAssetsInput
+  let flashAssets = flashAssetsInput
+  let autoDerivedWalletAssets = false
+  let autoDerivedFlashAssets = false
+
+  if (walletAssets != null && flashAssets != null) {
+    // Both helper fields are explicit. Final deposit can exceed initial capital when loop mode redeposits borrowed assets.
+  } else if (walletAssets != null) {
+    if (walletAssets > totalDepositAssets) {
+      throw new Error('Wallet token usage cannot exceed Final deposit amount.')
+    }
+    flashAssets = totalDepositAssets - walletAssets
+    autoDerivedFlashAssets = true
+  } else if (flashAssets != null) {
+    if (flashAssets > totalDepositAssets) {
+      throw new Error('Flash loan size cannot exceed Final deposit amount.')
+    }
+    walletAssets = totalDepositAssets - flashAssets
+    autoDerivedWalletAssets = true
+  } else {
+    autoDerivedWalletAssets = true
+    autoDerivedFlashAssets = true
+
+    let preferredWalletAssets = totalDepositAssets
+    if (preferredWalletAssets > parameters.snapshot.walletLoanTokenBalance) {
+      preferredWalletAssets = parameters.snapshot.walletLoanTokenBalance
+    }
+    if (preferredWalletAssets > parameters.snapshot.walletLoanTokenAllowanceToAdapter) {
+      preferredWalletAssets = parameters.snapshot.walletLoanTokenAllowanceToAdapter
+    }
+
+    walletAssets = preferredWalletAssets
+    flashAssets = totalDepositAssets - walletAssets
+
+    if (flashAssets > parameters.snapshot.maxFlashLoanAssets) {
+      let balanceCappedWalletAssets = totalDepositAssets
+      if (balanceCappedWalletAssets > parameters.snapshot.walletLoanTokenBalance) {
+        balanceCappedWalletAssets = parameters.snapshot.walletLoanTokenBalance
+      }
+      walletAssets = balanceCappedWalletAssets
+      flashAssets = totalDepositAssets - walletAssets
+    }
+  }
+
+  if (walletAssets == null || flashAssets == null) {
+    throw new Error('Failed to resolve the deposit sizing inputs.')
+  }
+  if (walletAssets + flashAssets <= 0n) {
+    throw new Error('Wallet token usage plus Flash loan size must be greater than zero to bootstrap the deposit loop.')
+  }
+
+  const minimumFinalBorrowAssetsForFlashRepayment = parameters.snapshot.borrowAssets + flashAssets
+  const minimumFinalBorrowAssetsForFunding =
+    totalDepositAssets > walletAssets
+      ? parameters.snapshot.borrowAssets + (totalDepositAssets - walletAssets)
+      : parameters.snapshot.borrowAssets
+  const minimumFinalBorrowAssets =
+    minimumFinalBorrowAssetsForFlashRepayment > minimumFinalBorrowAssetsForFunding
+      ? minimumFinalBorrowAssetsForFlashRepayment
+      : minimumFinalBorrowAssetsForFunding
+  const finalBorrowAssets = finalBorrowAssetsInput ?? minimumFinalBorrowAssets
+  const additionalBorrowTarget = finalBorrowAssets - parameters.snapshot.borrowAssets
+
+  if (finalBorrowAssets < minimumFinalBorrowAssets) {
+    throw new Error(
+      `Final borrow amount must be at least ${formatUnits(
+        minimumFinalBorrowAssets,
+        parameters.snapshot.loanTokenDecimals,
+      )} ${parameters.snapshot.loanTokenSymbol} so the flash principal can be repaid and the requested final deposit can be funded.`,
+    )
+  }
+  if (totalDepositAssets > walletAssets + additionalBorrowTarget) {
+    throw new Error(
+      `Final deposit amount exceeds what the requested wallet usage plus final additional borrow can fund. Max deposit with these inputs is ${formatUnits(
+        walletAssets + additionalBorrowTarget,
+        parameters.snapshot.loanTokenDecimals,
+      )} ${parameters.snapshot.loanTokenSymbol}.`,
+    )
+  }
+  if (walletAssets > parameters.snapshot.walletLoanTokenBalance) {
+    throw new Error(
+      `Wallet token usage exceeds the connected wallet balance. Available balance is ${formatUnits(
+        parameters.snapshot.walletLoanTokenBalance,
+        parameters.snapshot.loanTokenDecimals,
+      )} ${parameters.snapshot.loanTokenSymbol}.`,
+    )
+  }
+  return {
+    walletAssets,
+    flashAssets,
+    totalDepositAssets,
+    finalBorrowAssets,
+    targetBorrowAssets: finalBorrowAssets,
+    autoDerivedWalletAssets,
+    autoDerivedFlashAssets,
+    autoDerivedTotalDepositAssets,
+  }
 }
 
 function simulateRedeemExecutionPreview(parameters: {
@@ -2994,6 +3379,7 @@ function simulateDepositExecutionPreview(parameters: {
     kind: 'deposit',
     walletAssetsIn: parameters.summary.walletAssetsIn,
     currentBorrowAssets: parameters.summary.currentBorrowAssets,
+    targetDepositAssets: parameters.summary.targetDepositAssets,
     targetBorrowAssets: parameters.summary.targetBorrowAssets,
     flashAssets: parameters.summary.flashAssets,
     initialDepositAssets: parameters.summary.initialDepositAssets,
@@ -3007,6 +3393,14 @@ function simulateDepositExecutionPreview(parameters: {
     finalBorrowAssets: parameters.summary.finalBorrowAssets,
     netLoanTokenOut: parameters.summary.netLoanTokenOut,
     finalPosition: parameters.summary.finalPosition,
+    loopEnabled: parameters.summary.loopEnabled,
+    iterationCount: parameters.summary.iterationCount,
+    iterations: parameters.summary.iterations.map((iteration) => ({
+      index: iteration.index,
+      depositAssets: iteration.depositAssets,
+      borrowAssets: iteration.borrowAssets,
+      loanTokenBalanceAfter: iteration.loanTokenBalanceAfter,
+    })),
     completed: parameters.summary.completed,
     message: parameters.summary.message,
   }
@@ -3306,6 +3700,10 @@ function stringifyForDisplay(value: unknown): string {
 
 function absBigInt(value: bigint) {
   return value < 0n ? -value : value
+}
+
+function minBigInt(left: bigint, right: bigint) {
+  return left < right ? left : right
 }
 
 function clampNumber(value: number, min: number, max: number) {
