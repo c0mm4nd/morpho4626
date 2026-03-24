@@ -19,6 +19,7 @@ export type MarketParams = {
 }
 
 export type RepayMode = 'full-shares' | 'exact-assets'
+export type RedeemFlashAssetKind = 'loan-token' | 'vault-shares'
 
 export type MorphoAuthorizationPair = {
   authorize?: Authorization
@@ -59,6 +60,11 @@ export type MorphoBundlerRedeemParameters = {
   marketParams: MarketParams
   vault: Address
   flashAssets: bigint
+  flashAssetKind?: RedeemFlashAssetKind
+  flashLoanRedeemAssets?: bigint
+  flashLoanRepaymentAssets?: bigint
+  flashLoanMinSharePriceE27?: bigint
+  flashLoanMaxSharePriceE27?: bigint
   repayMode: RepayMode
   repayAssets?: bigint
   withdrawCollateralAssets: bigint
@@ -78,6 +84,17 @@ export type MorphoBundlerRedeemPlan = {
   bundlerAddress: Address
   generalAdapter1: Address
   loop: MorphoBundlerLoopSummary
+}
+
+type ResolvedRedeemFlashContext = {
+  flashAssetKind: RedeemFlashAssetKind
+  flashLoanToken: Address
+  flashLoanAmount: bigint
+  initialLoanTokenBalance: bigint
+  openingActions: Action[]
+  closingActions: Action[]
+  requiredLoanTokenBalanceAtCallbackEnd: bigint
+  insufficientBalanceMessage: string
 }
 
 export type MorphoBundlerDepositParameters = {
@@ -311,6 +328,7 @@ export function buildMorphoBundlerRedeemPlan(
 
   const normalizedChainId = parameters.chainId as ChainId
   const { bundler3 } = getChainAddresses(normalizedChainId)
+  const flashContext = resolveRedeemFlashContext(parameters)
   const authorization = buildMorphoAuthorizationPair({
     chainId: parameters.chainId,
     account: parameters.account,
@@ -319,9 +337,9 @@ export function buildMorphoBundlerRedeemPlan(
     autoRevoke: parameters.autoRevoke,
     skipInitialAuthorization: parameters.skipInitialAuthorization,
   })
-  const execution = shouldUseLoopExecution(parameters)
-    ? buildLoopExecution(parameters)
-    : buildSingleExecution(parameters)
+  const execution = shouldUseLoopExecution(parameters, flashContext.initialLoanTokenBalance)
+    ? buildLoopExecution(parameters, flashContext)
+    : buildSingleExecution(parameters, flashContext)
 
   const actions: Action[] = []
 
@@ -335,8 +353,8 @@ export function buildMorphoBundlerRedeemPlan(
   actions.push({
     type: 'morphoFlashLoan',
     args: [
-      parameters.marketParams.loanToken,
-      parameters.flashAssets,
+      flashContext.flashLoanToken,
+      flashContext.flashLoanAmount,
       execution.callbackActions,
       false,
     ],
@@ -543,12 +561,91 @@ export function buildMorphoBundlerDepositTransactionRequest(
   }
 }
 
-function shouldUseLoopExecution(parameters: MorphoBundlerRedeemParameters) {
-  return (
-    parameters.repayMode === 'full-shares' &&
-    parameters.withdrawCollateralAssets === parameters.accrualPosition.collateral &&
-    parameters.flashAssets < parameters.accrualPosition.borrowAssets
-  )
+function getRedeemFlashAssetKind(parameters: MorphoBundlerRedeemParameters): RedeemFlashAssetKind {
+  return parameters.flashAssetKind ?? 'loan-token'
+}
+
+function getTargetRepayAssets(parameters: MorphoBundlerRedeemParameters) {
+  return parameters.repayMode === 'full-shares'
+    ? parameters.accrualPosition.borrowAssets
+    : parameters.repayAssets ?? 0n
+}
+
+function resolveRedeemFlashContext(parameters: MorphoBundlerRedeemParameters): ResolvedRedeemFlashContext {
+  const adapter = getChainAddresses(parameters.chainId as ChainId).bundler3.generalAdapter1
+  const flashAssetKind = getRedeemFlashAssetKind(parameters)
+
+  if (flashAssetKind === 'vault-shares') {
+    return {
+      flashAssetKind,
+      flashLoanToken: parameters.vault,
+      flashLoanAmount: parameters.flashAssets,
+      initialLoanTokenBalance: parameters.flashLoanRedeemAssets ?? 0n,
+      openingActions: [
+        {
+          type: 'erc4626Redeem',
+          args: [
+            parameters.vault,
+            parameters.flashAssets,
+            parameters.flashLoanMinSharePriceE27 ?? 0n,
+            adapter,
+            adapter,
+            false,
+          ],
+        },
+      ],
+      closingActions: [
+        {
+          type: 'erc4626Mint',
+          args: [
+            parameters.vault,
+            parameters.flashAssets,
+            parameters.flashLoanMaxSharePriceE27 ?? 0n,
+            adapter,
+            false,
+          ],
+        },
+      ],
+      requiredLoanTokenBalanceAtCallbackEnd: parameters.flashLoanRepaymentAssets ?? 0n,
+      insufficientBalanceMessage:
+        'Redeemed loan-token assets are insufficient to re-wrap the wrapped flash-loan shares. Increase collateral withdrawal or reduce the repay target.',
+    }
+  }
+
+  return {
+    flashAssetKind,
+    flashLoanToken: parameters.marketParams.loanToken,
+    flashLoanAmount: parameters.flashAssets,
+    initialLoanTokenBalance: parameters.flashAssets,
+    openingActions: [],
+    closingActions: [],
+    requiredLoanTokenBalanceAtCallbackEnd: parameters.flashAssets,
+    insufficientBalanceMessage:
+      'Redeemed loan-token assets are insufficient to repay the flash-loan principal. Increase collateral withdrawal or reduce the repay target.',
+  }
+}
+
+function finalizeRedeemFlashBalance(context: ResolvedRedeemFlashContext, loanTokenBalance: bigint) {
+  if (loanTokenBalance < context.requiredLoanTokenBalanceAtCallbackEnd) {
+    return {
+      completed: false,
+      netLoanTokenOut: 0n,
+      message: context.insufficientBalanceMessage,
+    }
+  }
+
+  return {
+    completed: true,
+    netLoanTokenOut: loanTokenBalance - context.requiredLoanTokenBalanceAtCallbackEnd,
+    message: undefined,
+  }
+}
+
+function shouldUseLoopExecution(
+  parameters: MorphoBundlerRedeemParameters,
+  initialLoanTokenBalance: bigint,
+) {
+  return initialLoanTokenBalance < getTargetRepayAssets(parameters)
 }
 
 function buildDepositExecution(parameters: MorphoBundlerDepositParameters): {
@@ -596,11 +693,21 @@ function buildDepositExecution(parameters: MorphoBundlerDepositParameters): {
   return { callbackActions, summary }
 }
 
-function buildSingleExecution(parameters: MorphoBundlerRedeemParameters): {
+function buildSingleExecution(
+  parameters: MorphoBundlerRedeemParameters,
+  flashContext: ResolvedRedeemFlashContext,
+): {
   callbackActions: Action[]
   summary: MorphoBundlerLoopSummary
 } {
+  const summary = simulateSingleExecution(parameters, flashContext)
+  if (!summary.completed) {
+    throw new Error(summary.message || 'The redeem callback cannot repay the flash loan with the requested inputs.')
+  }
+
+  const adapter = getChainAddresses(parameters.chainId as ChainId).bundler3.generalAdapter1
   const callbackActions: Action[] = [
+    ...flashContext.openingActions,
     buildRepayAction(
       parameters.marketParams,
       parameters.account,
@@ -616,7 +723,7 @@ function buildSingleExecution(parameters: MorphoBundlerRedeemParameters): {
         args: [
           parameters.marketParams,
           parameters.withdrawCollateralAssets,
-          getChainAddresses(parameters.chainId as ChainId).bundler3.generalAdapter1,
+          adapter,
           false,
         ],
       },
@@ -626,21 +733,24 @@ function buildSingleExecution(parameters: MorphoBundlerRedeemParameters): {
           parameters.vault,
           parameters.withdrawCollateralAssets,
           parameters.minVaultSharePriceE27,
-          getChainAddresses(parameters.chainId as ChainId).bundler3.generalAdapter1,
-          getChainAddresses(parameters.chainId as ChainId).bundler3.generalAdapter1,
+          adapter,
+          adapter,
           false,
         ],
       },
     )
   }
 
-  const summary = simulateSingleExecution(parameters)
+  callbackActions.push(...flashContext.closingActions)
   return { callbackActions, summary }
 }
 
-function simulateSingleExecution(parameters: MorphoBundlerRedeemParameters): MorphoBundlerLoopSummary {
+function simulateSingleExecution(
+  parameters: MorphoBundlerRedeemParameters,
+  flashContext: ResolvedRedeemFlashContext,
+): MorphoBundlerLoopSummary {
   let working = cloneAccrualPosition(parameters.accrualPosition)
-  let loanTokenBalance = parameters.flashAssets
+  let loanTokenBalance = flashContext.initialLoanTokenBalance
   let totalRedeemedAssets = 0n
   let totalWithdrawCollateralAssets = 0n
   const iterations: MorphoBundlerLoopIteration[] = []
@@ -682,16 +792,19 @@ function simulateSingleExecution(parameters: MorphoBundlerRedeemParameters): Mor
     collateralAfter: working.collateral,
   })
 
+  const finalization = finalizeRedeemFlashBalance(flashContext, loanTokenBalance)
+
   return {
     enabled: false,
-    completed: true,
+    completed: finalization.completed,
     iterations,
     iterationCount: iterations.length,
     totalRepayAssets: repayResult.assets,
     totalWithdrawCollateralAssets,
     totalRedeemAssets: totalRedeemedAssets,
-    netLoanTokenOut: loanTokenBalance,
+    netLoanTokenOut: finalization.netLoanTokenOut,
     finalPosition: working,
+    message: finalization.message,
   }
 }
 
@@ -916,64 +1029,63 @@ function simulateDepositExecution(parameters: MorphoBundlerDepositParameters): M
   }
 }
 
-function buildLoopExecution(parameters: MorphoBundlerRedeemParameters): {
+function buildLoopExecution(
+  parameters: MorphoBundlerRedeemParameters,
+  flashContext: ResolvedRedeemFlashContext,
+): {
   callbackActions: Action[]
   summary: MorphoBundlerLoopSummary
 } {
-  const callbackActions: Action[] = []
+  const adapter = getChainAddresses(parameters.chainId as ChainId).bundler3.generalAdapter1
+  const callbackActions: Action[] = [...flashContext.openingActions]
   const iterations: MorphoBundlerLoopIteration[] = []
   const maxIterations = parameters.maxIterations ?? 12
   let working = cloneAccrualPosition(parameters.accrualPosition)
+  let remainingRepayAssets = getTargetRepayAssets(parameters)
   let remainingWithdrawCollateral = parameters.withdrawCollateralAssets
-  let availableLoanToken = parameters.flashAssets
+  let availableLoanToken = flashContext.initialLoanTokenBalance
   let totalRepayAssets = 0n
   let totalWithdrawCollateralAssets = 0n
   let totalRedeemAssets = 0n
 
   for (let index = 0; index < maxIterations; index += 1) {
-    if (working.borrowShares === 0n && remainingWithdrawCollateral === 0n) break
+    if (remainingRepayAssets === 0n && remainingWithdrawCollateral === 0n) break
 
     let repayMode: RepayMode = 'exact-assets'
     let repayAssets = 0n
     let repayShares = 0n
 
-    if (working.borrowShares > 0n) {
+    if (remainingRepayAssets > 0n && working.borrowShares > 0n) {
       const fullRepayResult = working.repay(0n, working.borrowShares)
+      const wantsFullRepay = remainingRepayAssets >= fullRepayResult.assets
       const canFullyRepay = availableLoanToken >= fullRepayResult.assets
 
-      if (canFullyRepay) {
+      if (wantsFullRepay && canFullyRepay) {
         repayMode = 'full-shares'
         repayAssets = fullRepayResult.assets
         repayShares = fullRepayResult.shares
         working = fullRepayResult.position
+        remainingRepayAssets = 0n
       } else {
-        if (availableLoanToken <= 0n) {
-          return {
-            callbackActions,
-            summary: {
-              enabled: true,
-              completed: false,
-              iterations,
-              iterationCount: iterations.length,
-              totalRepayAssets,
-              totalWithdrawCollateralAssets,
-              totalRedeemAssets,
-              netLoanTokenOut: availableLoanToken,
-              finalPosition: working,
-              message: 'Loop stopped because no loan-token balance remained for the next repay leg.',
-            },
-          }
+        const requestedRepayAssets = minBigInt(availableLoanToken, remainingRepayAssets)
+        if (requestedRepayAssets > 0n) {
+          const partialRepayResult = working.repay(requestedRepayAssets, 0n)
+          repayAssets = partialRepayResult.assets
+          repayShares = partialRepayResult.shares
+          working = partialRepayResult.position
+          remainingRepayAssets = remainingRepayAssets > repayAssets ? remainingRepayAssets - repayAssets : 0n
         }
-
-        const partialRepayResult = working.repay(availableLoanToken, 0n)
-        repayAssets = partialRepayResult.assets
-        repayShares = partialRepayResult.shares
-        working = partialRepayResult.position
       }
 
-      availableLoanToken -= repayAssets
-      totalRepayAssets += repayAssets
-      callbackActions.push(buildRepayAction(parameters.marketParams, parameters.account, repayMode, repayAssets))
+      if (working.borrowShares === 0n) {
+        remainingRepayAssets = 0n
+      }
+
+      if (repayAssets > 0n) {
+        availableLoanToken -= repayAssets
+        totalRepayAssets += repayAssets
+        callbackActions.push(buildRepayAction(parameters.marketParams, parameters.account, repayMode, repayAssets))
+      }
     }
 
     const requestedWithdraw = working.borrowShares === 0n
@@ -1004,7 +1116,7 @@ function buildLoopExecution(parameters: MorphoBundlerRedeemParameters): {
           args: [
             parameters.marketParams,
             withdrawCollateralAssets,
-            getChainAddresses(parameters.chainId as ChainId).bundler3.generalAdapter1,
+            adapter,
             false,
           ],
         },
@@ -1014,8 +1126,8 @@ function buildLoopExecution(parameters: MorphoBundlerRedeemParameters): {
             parameters.vault,
             withdrawCollateralAssets,
             parameters.minVaultSharePriceE27,
-            getChainAddresses(parameters.chainId as ChainId).bundler3.generalAdapter1,
-            getChainAddresses(parameters.chainId as ChainId).bundler3.generalAdapter1,
+            adapter,
+            adapter,
             false,
           ],
         },
@@ -1046,30 +1158,42 @@ function buildLoopExecution(parameters: MorphoBundlerRedeemParameters): {
           totalRepayAssets,
           totalWithdrawCollateralAssets,
           totalRedeemAssets,
-          netLoanTokenOut: availableLoanToken,
+          netLoanTokenOut: 0n,
           finalPosition: working,
-          message: 'Loop made no progress. Increase flash assets or reduce the requested exit size.',
+          message:
+            remainingRepayAssets > 0n
+              ? 'Loop made no progress toward the requested repay. Increase the collateral withdrawal, switch flash asset, or reduce the repay target.'
+              : 'Loop made no progress toward the requested collateral withdrawal. Reduce the withdrawal target or raise the repay amount.',
         },
       }
     }
+  }
+
+  const finalization = finalizeRedeemFlashBalance(flashContext, availableLoanToken)
+  const completed = remainingRepayAssets === 0n && remainingWithdrawCollateral === 0n && finalization.completed
+  if (completed) {
+    callbackActions.push(...flashContext.closingActions)
   }
 
   return {
     callbackActions,
     summary: {
       enabled: true,
-      completed: working.borrowShares === 0n && remainingWithdrawCollateral === 0n,
+      completed,
       iterations,
       iterationCount: iterations.length,
       totalRepayAssets,
       totalWithdrawCollateralAssets,
       totalRedeemAssets,
-      netLoanTokenOut: availableLoanToken,
+      netLoanTokenOut: completed ? finalization.netLoanTokenOut : 0n,
       finalPosition: working,
       message:
-        working.borrowShares === 0n && remainingWithdrawCollateral === 0n
+        completed
           ? undefined
-          : 'Loop hit the configured iteration limit before the full exit completed.',
+          : finalization.message ??
+            (remainingRepayAssets > 0n
+              ? 'Loop hit the configured iteration limit before the requested repay completed.'
+              : 'Loop hit the configured iteration limit before the requested collateral withdrawal completed.'),
     },
   }
 }
@@ -1164,14 +1288,19 @@ function assertRedeemParameters(parameters: MorphoBundlerRedeemParameters) {
   if (parameters.repayMode === 'exact-assets' && (!parameters.repayAssets || parameters.repayAssets <= 0n)) {
     throw new Error('repayAssets must be greater than zero in exact-assets mode.')
   }
-  if (
-    parameters.repayMode === 'full-shares' &&
-    parameters.flashAssets < parameters.accrualPosition.borrowAssets &&
-    parameters.withdrawCollateralAssets !== parameters.accrualPosition.collateral
-  ) {
-    throw new Error(
-      'Full borrow-shares mode with flash assets below the debt can only be completed when withdrawing all collateral through loop mode.',
-    )
+  if (getRedeemFlashAssetKind(parameters) === 'vault-shares') {
+    if (!parameters.flashLoanRedeemAssets || parameters.flashLoanRedeemAssets <= 0n) {
+      throw new Error('flashLoanRedeemAssets must be greater than zero when flashAssetKind is vault-shares.')
+    }
+    if (!parameters.flashLoanRepaymentAssets || parameters.flashLoanRepaymentAssets <= 0n) {
+      throw new Error('flashLoanRepaymentAssets must be greater than zero when flashAssetKind is vault-shares.')
+    }
+    if (!parameters.flashLoanMinSharePriceE27 || parameters.flashLoanMinSharePriceE27 <= 0n) {
+      throw new Error('flashLoanMinSharePriceE27 must be greater than zero when flashAssetKind is vault-shares.')
+    }
+    if (!parameters.flashLoanMaxSharePriceE27 || parameters.flashLoanMaxSharePriceE27 <= 0n) {
+      throw new Error('flashLoanMaxSharePriceE27 must be greater than zero when flashAssetKind is vault-shares.')
+    }
   }
 }
 
