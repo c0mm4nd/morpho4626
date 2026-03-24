@@ -2,6 +2,7 @@ import { getChainAddresses } from '@morpho-org/blue-sdk'
 import { BLUE_API_GRAPHQL_URL } from '@morpho-org/morpho-ts'
 import { createPublicClient, custom, isAddress, parseAbi, type Address, type Hex } from 'viem'
 
+import { findSupportedLitePsmRouteConfig, type SupportedLitePsmRouteConfig } from './depositFunding.js'
 import type { MarketParams } from '../sdk/morphoBundlerOfficial.js'
 
 type ProviderWithRequest = {
@@ -18,6 +19,8 @@ type DiscoveredVaultMarketCandidate = {
   loanTokenDecimals: number
   collateralTokenDecimals: number
   vaultAddress: Address
+  vaultAssetSymbol: string
+  vaultAssetName: string
   vaultName: string
   underlyingName: string
   curatorName: string | null
@@ -37,6 +40,7 @@ const erc4626ProbeAbi = parseAbi([
   'function previewDeposit(uint256 assets) view returns (uint256 shares)',
   'function previewRedeem(uint256 shares) view returns (uint256 assets)',
 ])
+const erc20MetadataAbi = parseAbi(['function decimals() view returns (uint8)', 'function symbol() view returns (string)'])
 
 export type MorphoChainInfo = {
   id: number
@@ -55,12 +59,15 @@ export type DiscoveredVaultMarket = {
   collateralTokenDecimals: number
   vaultAddress: Address
   vaultAsset: Address
+  vaultAssetSymbol: string
+  vaultAssetName: string
   vaultName: string
   underlyingName: string
   curatorName: string | null
   curatorAddress: Address | null
   marketSizeUsd: number | null
   marketLiquidityUsd: number | null
+  depositRouteKind: 'direct' | 'psm'
   canDirectDeposit: boolean
   canDirectRedeem: boolean
 }
@@ -91,6 +98,7 @@ export async function fetchMorphoChains(): Promise<MorphoChainInfo[]> {
 export async function discoverErc4626MarketsOnChain(parameters: {
   provider: ProviderWithRequest
   chainId: number
+  customLitePsmRoutes?: SupportedLitePsmRouteConfig[]
 }): Promise<DiscoveredVaultMarket[]> {
   if (!supportsLocalMorphoChain(parameters.chainId)) {
     throw new Error('The current chain is not supported by the installed Morpho SDK.')
@@ -235,6 +243,11 @@ export async function discoverErc4626MarketsOnChain(parameters: {
         loanTokenDecimals: Number(market.loanAsset.decimals),
         collateralTokenDecimals: Number(market.collateralAsset.decimals),
         vaultAddress: market.collateralAsset.address,
+        vaultAssetSymbol: market.collateralAsset.vault?.asset?.symbol?.trim() || market.loanAsset.symbol,
+        vaultAssetName:
+          market.collateralAsset.vault?.asset?.name?.trim() ||
+          market.loanAsset.name?.trim() ||
+          market.loanAsset.symbol,
         vaultName:
           market.collateralAsset.vault?.name?.trim() ||
           market.collateralAsset.name?.trim() ||
@@ -258,27 +271,49 @@ export async function discoverErc4626MarketsOnChain(parameters: {
     transport: custom(parameters.provider),
   })
 
-  const assetMatchedCandidates: Array<DiscoveredVaultMarketCandidate & { vaultAsset: Address }> = []
+  const assetMatchedCandidates: Array<
+    DiscoveredVaultMarketCandidate & {
+      vaultAsset: Address
+      vaultAssetDecimals: number
+      depositRouteKind: 'direct' | 'psm'
+    }
+  > = []
   for (let index = 0; index < discoveredCandidates.length; index += 25) {
     const chunk = discoveredCandidates.slice(index, index + 25)
     const results = await Promise.all(
       chunk.map(async (candidate) => {
         try {
-          const vaultAsset = assertAddress(
+          const vaultAsset = assertAddress(await client.readContract({
+            address: candidate.vaultAddress,
+            abi: erc4626ProbeAbi,
+            functionName: 'asset',
+          }))
+          const vaultAssetDecimals = Number(
             await client.readContract({
-              address: candidate.vaultAddress,
-              abi: erc4626ProbeAbi,
-              functionName: 'asset',
+              address: vaultAsset,
+              abi: erc20MetadataAbi,
+              functionName: 'decimals',
             }),
           )
+          const depositRouteKind =
+            vaultAsset.toLowerCase() === candidate.marketParams.loanToken.toLowerCase()
+              ? 'direct'
+              : findSupportedLitePsmRouteConfig({
+                    chainId: parameters.chainId,
+                    loanToken: candidate.marketParams.loanToken,
+                    vaultAsset,
+                    customRoutes: parameters.customLitePsmRoutes,
+                  })
+                ? 'psm'
+                : null
 
-          if (vaultAsset.toLowerCase() !== candidate.marketParams.loanToken.toLowerCase()) {
-            return null
-          }
+          if (!depositRouteKind) return null
 
           return {
             ...candidate,
             vaultAsset,
+            vaultAssetDecimals,
+            depositRouteKind,
           }
         } catch {
           return null
@@ -287,7 +322,15 @@ export async function discoverErc4626MarketsOnChain(parameters: {
     )
 
     assetMatchedCandidates.push(
-      ...results.filter((candidate): candidate is DiscoveredVaultMarketCandidate & { vaultAsset: Address } => candidate != null),
+      ...results.filter(
+        (
+          candidate,
+        ): candidate is DiscoveredVaultMarketCandidate & {
+          vaultAsset: Address
+          vaultAssetDecimals: number
+          depositRouteKind: 'direct' | 'psm'
+        } => candidate != null,
+      ),
     )
   }
 
@@ -299,7 +342,7 @@ export async function discoverErc4626MarketsOnChain(parameters: {
         const previewDepositShares = await previewPositiveDepositShares({
           client,
           vault: candidate.vaultAddress,
-          decimals: candidate.loanTokenDecimals,
+          decimals: candidate.vaultAssetDecimals,
         })
 
         if (previewDepositShares === 0n) return null
@@ -312,8 +355,9 @@ export async function discoverErc4626MarketsOnChain(parameters: {
 
         const discoveredMarket: DiscoveredVaultMarket = {
           ...candidate,
+          depositRouteKind: candidate.depositRouteKind,
           canDirectDeposit: true,
-          canDirectRedeem: previewRedeemAssets > 0n,
+          canDirectRedeem: candidate.depositRouteKind === 'direct' && previewRedeemAssets > 0n,
         }
 
         return discoveredMarket

@@ -85,6 +85,7 @@ export type MorphoBundlerDepositParameters = {
   account: Address
   marketParams: MarketParams
   vault: Address
+  depositAssetRoute?: MorphoBundlerDepositAssetRoute
   flashLoanLiquidityAssets: bigint
   marketBorrowLiquidityAssets: bigint
   walletAssets: bigint
@@ -101,9 +102,26 @@ export type MorphoBundlerDepositParameters = {
   previewDepositShares: bigint
 }
 
+export type MorphoBundlerDepositAssetRoute =
+  | {
+      kind: 'direct'
+      loanToken: Address
+      vaultAsset: Address
+    }
+  | {
+      kind: 'psm'
+      loanToken: Address
+      vaultAsset: Address
+      psmWrapper: Address
+      sellGemFeeWad: bigint
+      buyGemFeeWad: bigint
+      to18ConversionFactor: bigint
+    }
+
 export type MorphoBundlerDepositLoopIteration = {
   index: number
   depositAssets: bigint
+  loanTokenSpentForDeposit: bigint
   depositShares: bigint
   borrowAssets: bigint
   borrowShares: bigint
@@ -207,6 +225,29 @@ function estimateDepositSharesFromSharePriceE27(assets: bigint, sharePriceE27: b
 
   const ray = 10n ** 27n
   return (assets * ray) / sharePriceE27
+}
+
+export function quoteDepositAssetOutFromLoanToken(parameters: {
+  route?: MorphoBundlerDepositAssetRoute
+  loanTokenAmount: bigint
+}) {
+  if (parameters.loanTokenAmount <= 0n) return 0n
+  const route = parameters.route
+  if (!route || route.kind === 'direct') return parameters.loanTokenAmount
+  return (parameters.loanTokenAmount * route.to18ConversionFactor * (10n ** 18n - route.sellGemFeeWad)) / (10n ** 18n)
+}
+
+export function requiredLoanTokenForDepositAssetOut(parameters: {
+  route?: MorphoBundlerDepositAssetRoute
+  depositAssetAmount: bigint
+}) {
+  if (parameters.depositAssetAmount <= 0n) return 0n
+  const route = parameters.route
+  if (!route || route.kind === 'direct') return parameters.depositAssetAmount
+
+  const denominator = route.to18ConversionFactor * (10n ** 18n - route.sellGemFeeWad)
+  if (denominator <= 0n) throw new Error('PSM sell-gem route is not currently usable.')
+  return (parameters.depositAssetAmount * 10n ** 18n + denominator - 1n) / denominator
 }
 
 function cloneAccrualPosition(position: AccrualPosition) {
@@ -655,6 +696,7 @@ function simulateSingleExecution(parameters: MorphoBundlerRedeemParameters): Mor
 }
 
 function simulateDepositExecution(parameters: MorphoBundlerDepositParameters): MorphoBundlerDepositSummary {
+  const depositAssetRoute = parameters.depositAssetRoute
   const initialAvailableLoanToken = parameters.walletAssets + parameters.flashAssets
   const currentBorrowAssets = parameters.accrualPosition.borrowAssets
   const additionalBorrowTarget = parameters.targetBorrowAssets - currentBorrowAssets
@@ -689,6 +731,16 @@ function simulateDepositExecution(parameters: MorphoBundlerDepositParameters): M
     suppliedCollateralAssets += estimatedShares
     return estimatedShares
   }
+  const maxDepositAssetsFromLoanToken = (loanTokenAmount: bigint) =>
+    quoteDepositAssetOutFromLoanToken({
+      route: depositAssetRoute,
+      loanTokenAmount,
+    })
+  const loanTokenRequiredForDepositAssets = (depositAssets: bigint) =>
+    requiredLoanTokenForDepositAssetOut({
+      route: depositAssetRoute,
+      depositAssetAmount: depositAssets,
+    })
   const findSafeBorrowAssets = (position: AccrualPosition, requestedBorrowAssets: bigint) => {
     if (requestedBorrowAssets <= 0n) return 0n
 
@@ -717,8 +769,9 @@ function simulateDepositExecution(parameters: MorphoBundlerDepositParameters): M
   }
 
   const callbackBorrowLiquidityAfterFlash = minBigInt(remainingMarketBorrowLiquidity, remainingMorphoCallbackBalance)
+  const maxFundableDepositAssets = maxDepositAssetsFromLoanToken(parameters.walletAssets + additionalBorrowTarget)
 
-  if (parameters.targetDepositAssets > parameters.walletAssets + additionalBorrowTarget) {
+  if (parameters.targetDepositAssets > maxFundableDepositAssets) {
     const remainingBorrowCapacity = working.getBorrowCapacityLimit()?.value ?? 0n
     const safeAdditionalBorrowCapacity = findSafeBorrowAssets(
       working,
@@ -740,8 +793,8 @@ function simulateDepositExecution(parameters: MorphoBundlerDepositParameters): M
       maxSafeBorrowAfterInitialDeposit,
       callbackBorrowLiquidityAfterFlash,
       maxTargetBorrowAssetsAfterConstraints,
-      finalBorrowAssets: 0n,
-      finalBorrowShares: 0n,
+      finalBorrowAssets: working.borrowAssets,
+      finalBorrowShares: working.borrowShares,
       netLoanTokenOut: 0n,
       finalPosition: working,
       loopEnabled: parameters.targetDepositAssets > initialAvailableLoanToken,
@@ -749,17 +802,19 @@ function simulateDepositExecution(parameters: MorphoBundlerDepositParameters): M
       iterations,
       completed: false,
       message:
-        'Requested target deposit exceeds wallet assets plus the requested final additional borrow. Increase Wallet assets in or raise Target borrow after.',
+        'Requested target deposit exceeds what the wallet loan token plus the requested final additional borrow can fund after the vault-asset route. Increase Wallet assets in or raise Target borrow after.',
     }
   }
 
   for (let index = 0; index < maxIterations; index += 1) {
     if (remainingDepositAssets === 0n && remainingBorrowAssets === 0n) break
 
-    const depositAssets = minBigInt(availableLoanToken, remainingDepositAssets)
+    const maxDepositAssetsThisLeg = maxDepositAssetsFromLoanToken(availableLoanToken)
+    const depositAssets = minBigInt(maxDepositAssetsThisLeg, remainingDepositAssets)
+    const loanTokenSpentForDeposit = loanTokenRequiredForDepositAssets(depositAssets)
     const depositShares = supplyDepositedAssets(depositAssets)
     if (depositAssets > 0n) {
-      availableLoanToken -= depositAssets
+      availableLoanToken -= loanTokenSpentForDeposit
       remainingDepositAssets -= depositAssets
       if (iterations.length === 0) {
         initialDepositAssets = depositAssets
@@ -792,6 +847,7 @@ function simulateDepositExecution(parameters: MorphoBundlerDepositParameters): M
     iterations.push({
       index,
       depositAssets,
+      loanTokenSpentForDeposit,
       depositShares,
       borrowAssets,
       borrowShares,
@@ -829,7 +885,7 @@ function simulateDepositExecution(parameters: MorphoBundlerDepositParameters): M
         'Deposit loop reached the safe borrow limit before the requested target borrow was reached. Increase Wallet assets in, reduce Target deposit, or lower Target borrow after.'
     } else if (remainingDepositAssets > 0n && availableLoanToken === 0n && remainingBorrowAssets === 0n) {
       message =
-        'Deposit loop ran out of loan-token balance before the requested target deposit was reached. Increase Wallet assets in or raise Target borrow after.'
+        'Deposit loop ran out of loan-token balance after applying the vault-asset route before the requested target deposit was reached. Increase Wallet assets in or raise Target borrow after.'
     } else {
       message = 'Deposit loop hit the configured iteration limit before the requested target was completed.'
     }
@@ -848,8 +904,8 @@ function simulateDepositExecution(parameters: MorphoBundlerDepositParameters): M
     maxSafeBorrowAfterInitialDeposit,
     callbackBorrowLiquidityAfterFlash,
     maxTargetBorrowAssetsAfterConstraints,
-    finalBorrowAssets: totalBorrowAssets,
-    finalBorrowShares: totalBorrowShares,
+    finalBorrowAssets: working.borrowAssets,
+    finalBorrowShares: working.borrowShares,
     netLoanTokenOut: availableLoanToken > parameters.flashAssets ? availableLoanToken - parameters.flashAssets : 0n,
     finalPosition: working,
     loopEnabled: usedLoop,
@@ -1120,6 +1176,17 @@ function assertRedeemParameters(parameters: MorphoBundlerRedeemParameters) {
 }
 
 function assertDepositParameters(parameters: MorphoBundlerDepositParameters) {
+  if (parameters.depositAssetRoute?.kind === 'psm') {
+    if (parameters.depositAssetRoute.sellGemFeeWad < 0n || parameters.depositAssetRoute.sellGemFeeWad >= 10n ** 18n) {
+      throw new Error('depositAssetRoute.sellGemFeeWad must be between 0 and 1e18 - 1.')
+    }
+    if (parameters.depositAssetRoute.buyGemFeeWad < 0n || parameters.depositAssetRoute.buyGemFeeWad >= 10n ** 18n) {
+      throw new Error('depositAssetRoute.buyGemFeeWad must be between 0 and 1e18 - 1.')
+    }
+    if (parameters.depositAssetRoute.to18ConversionFactor <= 0n) {
+      throw new Error('depositAssetRoute.to18ConversionFactor must be greater than zero.')
+    }
+  }
   if (parameters.flashLoanLiquidityAssets < 0n) throw new Error('flashLoanLiquidityAssets cannot be negative.')
   if (parameters.marketBorrowLiquidityAssets < 0n) throw new Error('marketBorrowLiquidityAssets cannot be negative.')
   if (parameters.walletAssets < 0n) throw new Error('walletAssets cannot be negative.')

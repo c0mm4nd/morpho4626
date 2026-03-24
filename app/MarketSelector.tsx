@@ -65,7 +65,7 @@ export function MarketSelector(props: MarketSelectorProps) {
           />
           <MarketGroup
             title="Deposit only"
-            description="Vault previews direct deposit, but direct redeem is not available from the ERC-4626 probe."
+            description="Vault deposit is supported, including loan-token to vault-asset PSM routes, but direct redeem back into the loan token is not available."
             emptyLabel="No deposit-only ERC-4626 markets were found on this chain."
             markets={depositOnlyMarkets}
             selectedMarketId={props.selectedMarketId}
@@ -104,7 +104,7 @@ function MarketGroup(props: MarketGroupProps) {
                   <div>
                     <div className="market-card__title">{market.vaultName}</div>
                     <div className="market-card__subtitle">
-                      {`${market.collateralTokenSymbol} collateral / ${market.loanTokenSymbol} underlying`}
+                      {`${market.collateralTokenSymbol} collateral / ${market.loanTokenSymbol} loan token`}
                     </div>
                   </div>
                   <div className="market-card__size">{formatUsdCompact(market.marketSizeUsd)}</div>
@@ -114,6 +114,7 @@ function MarketGroup(props: MarketGroupProps) {
                   <span className="market-card__badge market-card__badge--active">
                     {market.canDirectRedeem ? 'Direct redeem' : 'Deposit only'}
                   </span>
+                  {market.depositRouteKind === 'psm' ? <span className="market-card__badge">PSM route</span> : null}
                   {isSelected ? <span className="market-card__badge">Selected</span> : null}
                 </div>
 
@@ -121,7 +122,7 @@ function MarketGroup(props: MarketGroupProps) {
                   <MetaRow label="Curator" value={formatCurator(market)} />
                   <MetaRow label="Market size" value={formatUsd(market.marketSizeUsd)} />
                   <MetaRow label="Liquidity" value={formatUsd(market.marketLiquidityUsd)} />
-                  <MetaRow label="Underlying" value={`${market.underlyingName} (${market.loanTokenSymbol})`} />
+                  <MetaRow label="Underlying" value={`${market.underlyingName} (${market.vaultAssetSymbol})`} />
                 </div>
 
                 <div className="market-card__address-grid">
